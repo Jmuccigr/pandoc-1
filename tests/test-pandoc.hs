@@ -8,8 +8,10 @@ import qualified Tests.Old
 import qualified Tests.Readers.LaTeX
 import qualified Tests.Readers.Markdown
 import qualified Tests.Readers.Org
+import qualified Tests.Readers.HTML
 import qualified Tests.Readers.RST
 import qualified Tests.Readers.Docx
+import qualified Tests.Readers.Odt
 import qualified Tests.Readers.Txt2Tags
 import qualified Tests.Readers.EPUB
 import qualified Tests.Writers.ConTeXt
@@ -22,6 +24,7 @@ import qualified Tests.Writers.Plain
 import qualified Tests.Writers.AsciiDoc
 import qualified Tests.Writers.Docx
 import qualified Tests.Writers.RST
+import qualified Tests.Writers.TEI
 import qualified Tests.Shared
 import qualified Tests.Walk
 import Text.Pandoc.Shared (inDirectory)
@@ -42,13 +45,16 @@ tests = [ testGroup "Old" Tests.Old.tests
           , testGroup "AsciiDoc" Tests.Writers.AsciiDoc.tests
           , testGroup "Docx" Tests.Writers.Docx.tests
           , testGroup "RST" Tests.Writers.RST.tests
+          , testGroup "TEI" Tests.Writers.TEI.tests
           ]
         , testGroup "Readers"
           [ testGroup "LaTeX" Tests.Readers.LaTeX.tests
           , testGroup "Markdown" Tests.Readers.Markdown.tests
+          , testGroup "HTML" Tests.Readers.HTML.tests
           , testGroup "Org" Tests.Readers.Org.tests
           , testGroup "RST" Tests.Readers.RST.tests
           , testGroup "Docx" Tests.Readers.Docx.tests
+          , testGroup "Odt" Tests.Readers.Odt.tests
           , testGroup "Txt2Tags" Tests.Readers.Txt2Tags.tests
           , testGroup "EPUB" Tests.Readers.EPUB.tests
           ]

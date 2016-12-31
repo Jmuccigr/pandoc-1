@@ -33,14 +33,14 @@ module Text.Pandoc.Writers.OpenDocument ( writeOpenDocument ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.XML
+import Text.Pandoc.Shared (linesToPara)
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Readers.TeXMath
 import Text.Pandoc.Pretty
 import Text.Printf ( printf )
-import Control.Applicative ( (<$>) )
 import Control.Arrow ( (***), (>>>) )
 import Control.Monad.State hiding ( when )
-import Data.Char (chr, isDigit)
+import Data.Char (chr)
 import qualified Data.Map as Map
 import Text.Pandoc.Writers.Shared
 
@@ -176,7 +176,7 @@ handleSpaces s
 -- | Convert Pandoc document to string in OpenDocument format.
 writeOpenDocument :: WriterOptions -> Pandoc -> String
 writeOpenDocument opts (Pandoc meta blocks) =
-  let colwidth = if writerWrapText opts
+  let colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
       render' = render colwidth
@@ -192,14 +192,13 @@ writeOpenDocument opts (Pandoc meta blocks) =
       listStyle (n,l) = inTags True "text:list-style"
                           [("style:name", "L" ++ show n)] (vcat l)
       listStyles  = map listStyle (stListStyles s)
-      automaticStyles = inTagsIndented "office:automatic-styles" $ vcat $
-                          reverse $ styles ++ listStyles
+      automaticStyles = vcat $ reverse $ styles ++ listStyles
       context = defField "body" body
               $ defField "automatic-styles" (render' automaticStyles)
               $ metadata
-  in  if writerStandalone opts
-         then renderTemplate' (writerTemplate opts) context
-         else body
+  in  case writerTemplate opts of
+           Nothing  -> body
+           Just tpl -> renderTemplate' tpl context
 
 withParagraphStyle :: WriterOptions -> String -> [Block] -> State WriterState Doc
 withParagraphStyle  o s (b:bs)
@@ -288,11 +287,12 @@ blockToOpenDocument o bs
     | Plain          b <- bs = if null b
                                   then return empty
                                   else inParagraphTags =<< inlinesToOpenDocument o b
-    | Para [Image c (s,'f':'i':'g':':':t)] <- bs
-                             = figure c s t
+    | Para [Image attr c (s,'f':'i':'g':':':t)] <- bs
+                             = figure attr c s t
     | Para           b <- bs = if null b
                                   then return empty
                                   else inParagraphTags =<< inlinesToOpenDocument o b
+    | LineBlock      b <- bs = blockToOpenDocument o $ linesToPara b
     | Div _ xs         <- bs = blocksToOpenDocument o xs
     | Header     i _ b <- bs = setFirstPara >>
                                (inHeaderTags  i =<< inlinesToOpenDocument o b)
@@ -336,7 +336,7 @@ blockToOpenDocument o bs
         mapM_ addParaStyle . newPara $ paraHStyles ++ paraStyles
         captionDoc <- if null c
                       then return empty
-                      else withParagraphStyle o "TableCaption" [Para c]
+                      else withParagraphStyle o "Table" [Para c]
         th <- if all null h
                  then return empty
                  else colHeadsToOpenDocument o name (map fst paraHStyles) h
@@ -344,10 +344,10 @@ blockToOpenDocument o bs
         return $ inTags True "table:table" [ ("table:name"      , name)
                                            , ("table:style-name", name)
                                            ] (vcat columns $$ th $$ vcat tr) $$ captionDoc
-      figure caption source title | null caption =
-        withParagraphStyle o "Figure" [Para [Image caption (source,title)]]
+      figure attr caption source title | null caption =
+        withParagraphStyle o "Figure" [Para [Image attr caption (source,title)]]
                                   | otherwise    = do
-        imageDoc <- withParagraphStyle o "FigureWithCaption" [Para [Image caption (source,title)]]
+        imageDoc <- withParagraphStyle o "FigureWithCaption" [Para [Image attr caption (source,title)]]
         captionDoc <- withParagraphStyle o "FigureCaption" [Para caption]
         return $ imageDoc $$ captionDoc
 
@@ -376,38 +376,49 @@ inlinesToOpenDocument o l = hcat <$> mapM (inlineToOpenDocument o) l
 -- | Convert an inline element to OpenDocument.
 inlineToOpenDocument :: WriterOptions -> Inline -> State WriterState Doc
 inlineToOpenDocument o ils
-    | Space         <- ils = inTextStyle space
-    | Span _ xs     <- ils = inlinesToOpenDocument o xs
-    | LineBreak     <- ils = return $ selfClosingTag "text:line-break" [] <> cr
-    | Str         s <- ils = inTextStyle $ handleSpaces $ escapeStringForXML s
-    | Emph        l <- ils = withTextStyle Italic $ inlinesToOpenDocument o l
-    | Strong      l <- ils = withTextStyle Bold   $ inlinesToOpenDocument o l
-    | Strikeout   l <- ils = withTextStyle Strike $ inlinesToOpenDocument o l
-    | Superscript l <- ils = withTextStyle Sup    $ inlinesToOpenDocument o l
-    | Subscript   l <- ils = withTextStyle Sub    $ inlinesToOpenDocument o l
-    | SmallCaps   l <- ils = withTextStyle SmallC $ inlinesToOpenDocument o l
-    | Quoted    t l <- ils = inQuotes t <$> inlinesToOpenDocument o l
-    | Code      _ s <- ils = withTextStyle Pre $ inTextStyle $ preformatted s
-    | Math      t s <- ils = inlinesToOpenDocument o (texMathToInlines t s)
-    | Cite      _ l <- ils = inlinesToOpenDocument o l
-    | RawInline f s <- ils = if f == Format "opendocument"
-                                then return $ text s
-                                else return empty
-    | Link  l (s,t) <- ils = mkLink s t <$> inlinesToOpenDocument o l
-    | Image _ (s,t) <- ils = mkImg  s t
-    | Note        l <- ils = mkNote l
-    | otherwise            = return empty
+  = case ils of
+    Space         -> inTextStyle space
+    SoftBreak
+     | writerWrapText o == WrapPreserve
+                  -> inTextStyle (preformatted "\n")
+     | otherwise  -> inTextStyle space
+    Span _ xs     -> inlinesToOpenDocument o xs
+    LineBreak     -> return $ selfClosingTag "text:line-break" []
+    Str         s -> inTextStyle $ handleSpaces $ escapeStringForXML s
+    Emph        l -> withTextStyle Italic $ inlinesToOpenDocument o l
+    Strong      l -> withTextStyle Bold   $ inlinesToOpenDocument o l
+    Strikeout   l -> withTextStyle Strike $ inlinesToOpenDocument o l
+    Superscript l -> withTextStyle Sup    $ inlinesToOpenDocument o l
+    Subscript   l -> withTextStyle Sub    $ inlinesToOpenDocument o l
+    SmallCaps   l -> withTextStyle SmallC $ inlinesToOpenDocument o l
+    Quoted    t l -> inQuotes t <$> inlinesToOpenDocument o l
+    Code      _ s -> inlinedCode $ preformatted s
+    Math      t s -> inlinesToOpenDocument o (texMathToInlines t s)
+    Cite      _ l -> inlinesToOpenDocument o l
+    RawInline f s -> if f == Format "opendocument"
+                       then return $ text s
+                       else return empty
+    Link _ l (s,t) ->  mkLink s t <$> inlinesToOpenDocument o l
+    Image attr _ (s,t) -> mkImg attr s t
+    Note        l  -> mkNote l
     where
       preformatted s = handleSpaces $ escapeStringForXML s
+      inlinedCode s = return $ inTags False "text:span" [("text:style-name", "Source_Text")] s
       mkLink   s t = inTags False "text:a" [ ("xlink:type" , "simple")
                                            , ("xlink:href" , s       )
                                            , ("office:name", t       )
                                            ] . inSpanTags "Definition"
-      mkImg  s t   = do
+      mkImg (_, _, kvs) s _ = do
                id' <- gets stImageId
                modify (\st -> st{ stImageId = id' + 1 })
+               let getDims [] = []
+                   getDims (("width", w) :xs) = ("svg:width", w)  : getDims xs
+                   getDims (("height", h):xs) = ("svg:height", h) : getDims xs
+                   getDims (x@("style:rel-width", _) :xs) = x : getDims xs
+                   getDims (x@("style:rel-height", _):xs) = x : getDims xs
+                   getDims (_:xs) =                             getDims xs
                return $ inTags False "draw:frame"
-                        (("draw:name", "img" ++ show id'):attrsFromTitle t) $
+                        (("draw:name", "img" ++ show id') : getDims kvs) $
                      selfClosingTag "draw:image" [ ("xlink:href"   , s       )
                                                  , ("xlink:type"   , "simple")
                                                  , ("xlink:show"   , "embed" )
@@ -422,17 +433,6 @@ inlineToOpenDocument o ils
         nn <- footNote <$> withParagraphStyle o "Footnote" l
         addNote nn
         return nn
-
--- a title of the form "120x140" will be interpreted as image
--- size in points.
-attrsFromTitle :: String -> [(String,String)]
-attrsFromTitle s = if null xs || null ys
-                      then []
-                      else [("svg:width",xs ++ "pt"),("svg:height",ys ++ "pt")]
-  where (xs,rest) = span isDigit s
-        ys        = case rest of
-                         ('x':zs) | all isDigit zs -> zs
-                         _ -> ""
 
 bulletListStyle :: Int -> State WriterState (Int,(Int,[Doc]))
 bulletListStyle l =

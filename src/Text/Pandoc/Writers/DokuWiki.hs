@@ -42,11 +42,12 @@ module Text.Pandoc.Writers.DokuWiki ( writeDokuWiki ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Options ( WriterOptions(
                                 writerTableOfContents
-                              , writerStandalone
-                              , writerTemplate) )
-import Text.Pandoc.Shared ( escapeURI, removeFormatting, camelCaseToHyphenated
-                          , trimr, normalize, substitute  )
+                              , writerTemplate
+                              , writerWrapText), WrapOption(..) )
+import Text.Pandoc.Shared ( escapeURI, linesToPara, removeFormatting
+                          , camelCaseToHyphenated, trimr, normalize, substitute )
 import Text.Pandoc.Writers.Shared ( defField, metaToJSON )
+import Text.Pandoc.ImageSize
 import Text.Pandoc.Templates ( renderTemplate' )
 import Data.List ( intersect, intercalate, isPrefixOf, transpose )
 import Data.Default (Default(..))
@@ -54,7 +55,6 @@ import Network.URI ( isURI )
 import Control.Monad ( zipWithM )
 import Control.Monad.State ( modify, State, get, evalState )
 import Control.Monad.Reader ( ReaderT, runReaderT, ask, local )
-import Control.Applicative ( (<$>) )
 
 data WriterState = WriterState {
     stNotes     :: Bool            -- True if there are notes
@@ -101,9 +101,9 @@ pandocToDokuWiki opts (Pandoc meta blocks) = do
   let context = defField "body" main
                 $ defField "toc" (writerTableOfContents opts)
                 $ metadata
-  if writerStandalone opts
-     then return $ renderTemplate' (writerTemplate opts) context
-     else return main
+  case writerTemplate opts of
+       Nothing  -> return main
+       Just tpl -> return $ renderTemplate' tpl context
 
 -- | Escape special characters for DokuWiki.
 escapeString :: String -> String
@@ -127,7 +127,7 @@ blockToDokuWiki opts (Plain inlines) =
 
 -- title beginning with fig: indicates that the image is a figure
 -- dokuwiki doesn't support captions - so combine together alt and caption into alt
-blockToDokuWiki opts (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
+blockToDokuWiki opts (Para [Image attr txt (src,'f':'i':'g':':':tit)]) = do
   capt <- if null txt
              then return ""
              else (" " ++) `fmap` inlineListToDokuWiki opts txt
@@ -136,7 +136,7 @@ blockToDokuWiki opts (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
                else "|" ++ if null tit then capt else tit ++ capt
       -- Relative links fail isURI and receive a colon
       prefix = if isURI src then "" else ":"
-  return $ "{{" ++ prefix ++ src ++ opt ++ "}}\n"
+  return $ "{{" ++ prefix ++ src ++ imageDims opts attr ++ opt ++ "}}\n"
 
 blockToDokuWiki opts (Para inlines) = do
   indent <- stIndent <$> ask
@@ -145,6 +145,9 @@ blockToDokuWiki opts (Para inlines) = do
   return $ if useTags
               then "<HTML><p></HTML>" ++ contents ++ "<HTML></p></HTML>"
               else contents ++ if null indent then "\n" else ""
+
+blockToDokuWiki opts (LineBlock lns) =
+  blockToDokuWiki opts $ linesToPara lns
 
 blockToDokuWiki _ (RawBlock f str)
   | f == Format "dokuwiki" = return str
@@ -172,10 +175,10 @@ blockToDokuWiki _ (CodeBlock (_,classes,_) str) = do
                        "python", "qbasic", "rails", "reg", "robots", "ruby", "sas", "scheme", "sdlbasic",
                        "smalltalk", "smarty", "sql", "tcl", "", "thinbasic", "tsql", "vb", "vbnet", "vhdl",
                        "visualfoxpro", "winbatch", "xml", "xpp", "z80"]
-  let (beg, end) = if null at
-                      then ("<code" ++ if null classes then ">" else " class=\"" ++ unwords classes ++ "\">", "</code>")
-                      else ("<source lang=\"" ++ head at ++ "\">", "</source>")
-  return $ beg ++ str ++ end
+  return $ "<code" ++
+                (case at of
+                      [] -> ">\n"
+                      (x:_) -> " " ++ x ++ ">\n") ++ str ++ "\n</code>"
 
 blockToDokuWiki opts (BlockQuote blocks) = do
   contents <- blockListToDokuWiki opts blocks
@@ -451,8 +454,11 @@ inlineToDokuWiki _ (Code _ str) =
 
 inlineToDokuWiki _ (Str str) = return $ escapeString str
 
-inlineToDokuWiki _ (Math _ str) = return $ "<math>" ++ str ++ "</math>"
+inlineToDokuWiki _ (Math mathType str) = return $ delim ++ str ++ delim
                                  -- note:  str should NOT be escaped
+  where delim = case mathType of
+                     DisplayMath -> "$$"
+                     InlineMath  -> "$"
 
 inlineToDokuWiki _ (RawInline f str)
   | f == Format "dokuwiki" = return str
@@ -461,20 +467,26 @@ inlineToDokuWiki _ (RawInline f str)
 
 inlineToDokuWiki _ (LineBreak) = return "\\\\\n"
 
+inlineToDokuWiki opts SoftBreak =
+  case writerWrapText opts of
+       WrapNone     -> return " "
+       WrapAuto     -> return " "
+       WrapPreserve -> return "\n"
+
 inlineToDokuWiki _ Space = return " "
 
-inlineToDokuWiki opts (Link txt (src, _)) = do
+inlineToDokuWiki opts (Link _ txt (src, _)) = do
   label <- inlineListToDokuWiki opts txt
   case txt of
      [Str s] | "mailto:" `isPrefixOf` src -> return $ "<" ++ s ++ ">"
              | escapeURI s == src -> return src
      _  -> if isURI src
-              then return $ "[[" ++ src ++ "|" ++ label ++ "]]"
+              then return $ "[[" ++ src  ++ "|" ++ label ++ "]]"
               else return $ "[[" ++ src' ++ "|" ++ label ++ "]]"
                      where src' = case src of
                                      '/':xs -> xs  -- with leading / it's a
                                      _      -> src -- link to a help page
-inlineToDokuWiki opts (Image alt (source, tit)) = do
+inlineToDokuWiki opts (Image attr alt (source, tit)) = do
   alt' <- inlineListToDokuWiki opts alt
   let txt = case (tit, alt) of
               ("", []) -> ""
@@ -482,10 +494,21 @@ inlineToDokuWiki opts (Image alt (source, tit)) = do
               (_ , _ ) -> "|" ++ tit
       -- Relative links fail isURI and receive a colon
       prefix = if isURI source then "" else ":"
-  return $ "{{" ++ prefix ++ source ++ txt ++ "}}"
+  return $ "{{" ++ prefix ++ source ++ imageDims opts attr ++ txt ++ "}}"
 
 inlineToDokuWiki opts (Note contents) = do
   contents' <- blockListToDokuWiki opts contents
   modify (\s -> s { stNotes = True })
   return $ "((" ++ contents' ++ "))"
   -- note - may not work for notes with multiple blocks
+
+imageDims :: WriterOptions -> Attr -> String
+imageDims opts attr = go (toPx $ dimension Width attr) (toPx $ dimension Height attr)
+  where
+    toPx = fmap (showInPixel opts) . checkPct
+    checkPct (Just (Percent _)) = Nothing
+    checkPct maybeDim = maybeDim
+    go (Just w) Nothing  = "?" ++ w
+    go (Just w) (Just h) = "?" ++ w ++ "x" ++ h
+    go Nothing  (Just h) = "?0x" ++ h
+    go Nothing  Nothing  = ""

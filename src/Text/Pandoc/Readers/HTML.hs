@@ -43,30 +43,32 @@ import Text.HTML.TagSoup.Match
 import Text.Pandoc.Definition
 import qualified Text.Pandoc.Builder as B
 import Text.Pandoc.Builder (Blocks, Inlines, trimInlines, HasMeta(..))
-import Text.Pandoc.Shared ( extractSpaces, renderTags'
+import Text.Pandoc.Shared ( extractSpaces, renderTags', addMetaField
                           , escapeURI, safeRead, mapLeft )
 import Text.Pandoc.Options (ReaderOptions(readerParseRaw, readerTrace)
                            , Extension (Ext_epub_html_exts,
                                Ext_native_divs, Ext_native_spans))
 import Text.Pandoc.Parsing hiding ((<|>))
 import Text.Pandoc.Walk
+import qualified Data.Map as M
 import Data.Maybe ( fromMaybe, isJust)
 import Data.List ( intercalate, isInfixOf, isPrefixOf )
 import Data.Char ( isDigit )
-import Control.Monad ( liftM, guard, when, mzero, void, unless )
+import Control.Monad ( guard, when, mzero, void, unless )
 import Control.Arrow ((***))
-import Control.Applicative ( (<$>), (<$), (<*), (*>), (<|>))
-import Data.Monoid (mconcat, Monoid, mempty, (<>), First (..))
+import Control.Applicative ( (<|>) )
+import Data.Monoid (First (..))
 import Text.Printf (printf)
 import Debug.Trace (trace)
 import Text.TeXMath (readMathML, writeTeX)
 import Data.Default (Default (..), def)
 import Control.Monad.Reader (Reader,ask, asks, local, runReader)
-
+import Network.URI (URI, parseURIReference, nonStrictRelativeTo)
 import Text.Pandoc.Error
-
+import Text.Pandoc.CSS (foldOrElse, pickStyleAttrProps)
+import Data.Monoid ((<>))
 import Text.Parsec.Error
-
+import qualified Data.Set as Set
 
 -- | Convert HTML-formatted string to 'Pandoc' document.
 readHtml :: ReaderOptions -- ^ Reader options
@@ -74,7 +76,9 @@ readHtml :: ReaderOptions -- ^ Reader options
          -> Either PandocError Pandoc
 readHtml opts inp =
     mapLeft (ParseFailure . getError) . flip runReader def $
-      runParserT parseDoc (HTMLState def{ stateOptions = opts } []) "source" tags
+      runParserT parseDoc
+        (HTMLState def{ stateOptions = opts } [] Nothing Set.empty M.empty)
+        "source" tags
     where tags = stripPrefixes . canonicalizeTags $
                    parseTagsOptions parseOptions{ optTagPosition = True } inp
           parseDoc = do
@@ -98,7 +102,10 @@ replaceNotes' x = return x
 data HTMLState =
   HTMLState
   {  parserState :: ParserState,
-     noteTable   :: [(String, Blocks)]
+     noteTable   :: [(String, Blocks)],
+     baseHref    :: Maybe URI,
+     identifiers :: Set.Set String,
+     headerMap   :: M.Map Inlines String
   }
 
 data HTMLLocal = HTMLLocal { quoteContext :: QuoteContext
@@ -120,7 +127,7 @@ pBody :: TagParser Blocks
 pBody = pInTags "body" block
 
 pHead :: TagParser Blocks
-pHead = pInTags "head" $ pTitle <|> pMetaTag <|> (mempty <$ pAnyTag)
+pHead = pInTags "head" $ pTitle <|> pMetaTag <|> pBaseTag <|> (mempty <$ pAnyTag)
   where pTitle = pInTags "title" inline >>= setTitle . trimInlines
         setTitle t = mempty <$ (updateState $ B.setMeta "title" t)
         pMetaTag = do
@@ -130,8 +137,17 @@ pHead = pInTags "head" $ pTitle <|> pMetaTag <|> (mempty <$ pAnyTag)
              then return mempty
              else do
                let content = fromAttrib "content" mt
-               updateState $ B.setMeta name (B.text content)
+               updateState $ \s ->
+                 let ps = parserState s in
+                 s{ parserState = ps{
+                      stateMeta = addMetaField name (B.text content)
+                                   (stateMeta ps) } }
                return mempty
+        pBaseTag = do
+          bt <- pSatisfy (~== TagOpen "base" [])
+          updateState $ \st -> st{ baseHref =
+               parseURIReference $ fromAttrib "href" bt }
+          return mempty
 
 block :: TagParser Blocks
 block = do
@@ -239,6 +255,22 @@ pListItem nonItem = do
   let liDiv = maybe mempty (\x -> B.divWith (x, [], []) mempty) (lookup "id" attr)
   (liDiv <>) <$> pInTags "li" block <* skipMany nonItem
 
+parseListStyleType :: String -> ListNumberStyle
+parseListStyleType "lower-roman" = LowerRoman
+parseListStyleType "upper-roman" = UpperRoman
+parseListStyleType "lower-alpha" = LowerAlpha
+parseListStyleType "upper-alpha" = UpperAlpha
+parseListStyleType "decimal"     = Decimal
+parseListStyleType _             = DefaultStyle
+
+parseTypeAttr :: String -> ListNumberStyle
+parseTypeAttr "i" = LowerRoman
+parseTypeAttr "I" = UpperRoman
+parseTypeAttr "a" = LowerAlpha
+parseTypeAttr "A" = UpperAlpha
+parseTypeAttr "1" = Decimal
+parseTypeAttr _   = DefaultStyle
+
 pOrderedList :: TagParser Blocks
 pOrderedList = try $ do
   TagOpen _ attribs <- pSatisfy (~== TagOpen "ol" [])
@@ -248,16 +280,19 @@ pOrderedList = try $ do
                              sta' = if all isDigit sta
                                        then read sta
                                        else 1
-                             sty = fromMaybe (fromMaybe "" $
-                                   lookup "style" attribs) $
-                                   lookup "class" attribs
-                             sty' = case sty of
-                                     "lower-roman"  -> LowerRoman
-                                     "upper-roman"  -> UpperRoman
-                                     "lower-alpha"  -> LowerAlpha
-                                     "upper-alpha"  -> UpperAlpha
-                                     "decimal"      -> Decimal
-                                     _              -> DefaultStyle
+
+                             pickListStyle = pickStyleAttrProps ["list-style-type", "list-style"]
+
+                             typeAttr  = fromMaybe "" $ lookup "type"  attribs
+                             classAttr = fromMaybe "" $ lookup "class" attribs
+                             styleAttr = fromMaybe "" $ lookup "style" attribs
+                             listStyle = fromMaybe "" $ pickListStyle styleAttr
+
+                             sty' = foldOrElse DefaultStyle
+                                      [ parseTypeAttr      typeAttr
+                                      , parseListStyleType classAttr
+                                      , parseListStyleType listStyle
+                                      ]
   let nonItem = pSatisfy (\t ->
                   not (tagOpen (`elem` ["li","ol","ul","dl"]) (const True) t) &&
                   not (t ~== TagClose "ol"))
@@ -310,9 +345,16 @@ pRawTag = do
 pDiv :: TagParser Blocks
 pDiv = try $ do
   guardEnabled Ext_native_divs
-  TagOpen _ attr <- lookAhead $ pSatisfy $ tagOpen (=="div") (const True)
-  contents <- pInTags "div" block
-  return $ B.divWith (mkAttr attr) contents
+  let isDivLike "div" = True
+      isDivLike "section" = True
+      isDivLike _ = False
+  TagOpen tag attr <- lookAhead $ pSatisfy $ tagOpen isDivLike (const True)
+  contents <- pInTags tag block
+  let (ident, classes, kvs) = mkAttr attr
+  let classes' = if tag == "section"
+                    then "section":classes
+                    else classes
+  return $ B.divWith (ident, classes', kvs) contents
 
 pRawHtmlBlock :: TagParser Blocks
 pRawHtmlBlock = do
@@ -365,9 +407,10 @@ pHeader = try $ do
   let ident = fromMaybe "" $ lookup "id" attr
   let classes = maybe [] words $ lookup "class" attr
   let keyvals = [(k,v) | (k,v) <- attr, k /= "class", k /= "id"]
+  attr' <- registerHeader (ident, classes, keyvals) contents
   return $ if bodyTitle
               then mempty  -- skip a representation of the title in the body
-              else B.headerWith (ident, classes, keyvals) level contents
+              else B.headerWith attr' level contents
 
 pHrule :: TagParser Blocks
 pHrule = do
@@ -379,7 +422,6 @@ pTable = try $ do
   TagOpen _ _ <- pSatisfy (~== TagOpen "table" [])
   skipMany pBlank
   caption <- option mempty $ pInTags "caption" inline <* skipMany pBlank
-  -- TODO actually read these and take width information from them
   widths' <- (mconcat <$> many1 pColgroup) <|> many pCol
   let pTh = option [] $ pInTags "tr" (pCell "th")
       pTr = try $ skipMany pBlank >> pInTags "tr" (pCell "td" <|> pCell "th")
@@ -392,16 +434,20 @@ pTable = try $ do
   rowsLs <- many pTBody
   rows'  <- pOptInTag "tfoot" $ many pTr
   TagClose _ <- pSatisfy (~== TagClose "table")
-  let rows = (concat rowsLs) ++ rows'
+  let rows'' = (concat rowsLs) ++ rows'
   -- fail on empty table
-  guard $ not $ null head' && null rows
+  guard $ not $ null head' && null rows''
   let isSinglePlain x = case B.toList x of
+                             []        -> True
                              [Plain _] -> True
                              _         -> False
-  let isSimple = all isSinglePlain $ concat (head':rows)
-  let cols = length $ if null head' then head rows else head'
-  -- fail if there are colspans or rowspans
-  guard $ all (\r -> length r == cols) rows
+  let isSimple = all isSinglePlain $ concat (head':rows'')
+  let cols = length $ if null head' then head rows'' else head'
+  -- add empty cells to short rows
+  let addEmpties r = case cols - length r of
+                           n | n > 0 -> r ++ replicate n mempty
+                             | otherwise -> r
+  let rows = map addEmpties rows''
   let aligns = replicate cols AlignDefault
   let widths = if null widths'
                   then if isSimple
@@ -417,6 +463,11 @@ pCol = try $ do
   optional $ pSatisfy (~== TagClose "col")
   skipMany pBlank
   return $ case lookup "width" attribs of
+           Nothing -> case lookup "style" attribs of
+               Just ('w':'i':'d':'t':'h':':':xs) | '%' `elem` xs ->
+                 fromMaybe 0.0 $ safeRead ('0':'.':filter
+                   (`notElem` " \t\r\n%'\";") xs)
+               _ -> 0.0
            Just x | not (null x) && last x == '%' ->
              fromMaybe 0.0 $ safeRead ('0':'.':init x)
            _ -> 0.0
@@ -427,10 +478,17 @@ pColgroup = try $ do
   skipMany pBlank
   manyTill pCol (pCloses "colgroup" <|> eof) <* skipMany pBlank
 
+noColOrRowSpans :: Tag String -> Bool
+noColOrRowSpans t = isNullOrOne "colspan" && isNullOrOne "rowspan"
+  where isNullOrOne x = case fromAttrib x t of
+                              ""  -> True
+                              "1" -> True
+                              _   -> False
+
 pCell :: String -> TagParser [Blocks]
 pCell celltype = try $ do
   skipMany pBlank
-  res <- pInTags celltype block
+  res <- pInTags' celltype noColOrRowSpans block
   skipMany pBlank
   return [res]
 
@@ -555,33 +613,49 @@ pLineBreak = do
   pSelfClosing (=="br") (const True)
   return B.linebreak
 
+-- Unlike fromAttrib from tagsoup, this distinguishes
+-- between a missing attribute and an attribute with empty content.
+maybeFromAttrib :: String -> Tag String -> Maybe String
+maybeFromAttrib name (TagOpen _ attrs) = lookup name attrs
+maybeFromAttrib _ _ = Nothing
+
 pLink :: TagParser Inlines
-pLink = pRelLink <|> pAnchor
-
-pAnchor :: TagParser Inlines
-pAnchor = try $ do
-  tag <- pSatisfy (tagOpenLit "a" (isJust . lookup "id"))
-  return $ B.spanWith (fromAttrib "id" tag , [], []) mempty
-
-pRelLink :: TagParser Inlines
-pRelLink = try $ do
-  tag <- pSatisfy (tagOpenLit "a" (isJust . lookup "href"))
-  let url = fromAttrib "href" tag
+pLink = try $ do
+  tag <- pSatisfy $ tagOpenLit "a" (const True)
   let title = fromAttrib "title" tag
-  let uid = fromAttrib "id" tag
-  let spanC = case uid of
-              [] -> id
-              s  -> B.spanWith (s, [], [])
+  -- take id from id attribute if present, otherwise name
+  let uid = maybe (fromAttrib "name" tag) id $ maybeFromAttrib "id" tag
+  let cls = words $ fromAttrib "class" tag
   lab <- trimInlines . mconcat <$> manyTill inline (pCloses "a")
-  return $ spanC $ B.link (escapeURI url) title lab
+  -- check for href; if href, then a link, otherwise a span
+  case maybeFromAttrib "href" tag of
+       Nothing   ->
+         return $ B.spanWith (uid, cls, []) lab
+       Just url' -> do
+         mbBaseHref <- baseHref <$> getState
+         let url = case (parseURIReference url', mbBaseHref) of
+                        (Just rel, Just bs) ->
+                          show (rel `nonStrictRelativeTo` bs)
+                        _                   -> url'
+         return $ B.linkWith (uid, cls, []) (escapeURI url) title lab
 
 pImage :: TagParser Inlines
 pImage = do
   tag <- pSelfClosing (=="img") (isJust . lookup "src")
-  let url = fromAttrib "src" tag
+  mbBaseHref <- baseHref <$> getState
+  let url' = fromAttrib "src" tag
+  let url = case (parseURIReference url', mbBaseHref) of
+                 (Just rel, Just bs) -> show (rel `nonStrictRelativeTo` bs)
+                 _                   -> url'
   let title = fromAttrib "title" tag
   let alt = fromAttrib "alt" tag
-  return $ B.image (escapeURI url) title (B.text alt)
+  let uid = fromAttrib "id" tag
+  let cls = words $ fromAttrib "class" tag
+  let getAtt k = case fromAttrib k tag of
+                   "" -> []
+                   v  -> [(k, v)]
+  let kvs = concat $ map getAtt ["width", "height", "sizes", "srcset"]
+  return $ B.imageWith (uid, cls, kvs) (escapeURI url) title (B.text alt)
 
 pCode :: TagParser Inlines
 pCode = try $ do
@@ -594,12 +668,11 @@ pSpan = try $ do
   guardEnabled Ext_native_spans
   TagOpen _ attr <- lookAhead $ pSatisfy $ tagOpen (=="span") (const True)
   contents <- pInTags "span" inline
-  let attr' = mkAttr attr
-  return $ case attr' of
-                ("",[],[("style",s)])
-                  | filter (`notElem` " \t;") s == "font-variant:small-caps" ->
-                     B.smallcaps contents
-                _ -> B.spanWith (mkAttr attr) contents
+  let isSmallCaps = fontVariant == "small-caps"
+                    where styleAttr   = fromMaybe "" $ lookup "style" attr
+                          fontVariant = fromMaybe "" $ pickStyleAttrProps ["font-variant"] styleAttr
+  let tag = if isSmallCaps then B.smallcaps else B.spanWith (mkAttr attr)
+  return $ tag contents
 
 pRawHtmlInline :: TagParser Inlines
 pRawHtmlInline = do
@@ -619,24 +692,30 @@ mathMLToTeXMath s = writeTeX <$> readMathML s
 pMath :: Bool -> TagParser Inlines
 pMath inCase = try $ do
   open@(TagOpen _ attr) <- pSatisfy $ tagOpen (=="math") (const True)
-  unless (inCase) (guard (maybe False  (== mathMLNamespace) (lookup "xmlns" attr)))
+  -- we'll assume math tags are MathML unless specially marked
+  -- otherwise...
+  unless inCase $
+    guard (maybe True (== mathMLNamespace) (lookup "xmlns" attr))
   contents <- manyTill pAnyTag (pSatisfy (~== TagClose "math"))
-  let math = mathMLToTeXMath $
-              (renderTags $ [open] ++ contents ++ [TagClose "math"])
-  let constructor =
-        maybe B.math (\x -> if (x == "inline") then B.math else B.displayMath)
-          (lookup "display" attr)
-  return $ either (const mempty)
-            (\x -> if null x then mempty else constructor x) math
+  case mathMLToTeXMath (renderTags $ [open] ++ contents ++ [TagClose "math"]) of
+       Left _   -> return $ B.spanWith ("",["math"],attr) $ B.text $
+                             innerText contents
+       Right [] -> return mempty
+       Right x  -> return $ case lookup "display" attr of
+                                 Just "block" -> B.displayMath x
+                                 _            -> B.math x
 
 pInlinesInTags :: String -> (Inlines -> Inlines)
                -> TagParser Inlines
 pInlinesInTags tagtype f = extractSpaces f <$> pInTags tagtype inline
 
-pInTags :: (Monoid a) => String -> TagParser a
-        -> TagParser a
-pInTags tagtype parser = try $ do
-  pSatisfy (~== TagOpen tagtype [])
+pInTags :: (Monoid a) => String -> TagParser a -> TagParser a
+pInTags tagtype parser = pInTags' tagtype (const True) parser
+
+pInTags' :: (Monoid a) => String -> (Tag String -> Bool) -> TagParser a
+                       -> TagParser a
+pInTags' tagtype tagtest parser = try $ do
+  pSatisfy (\t -> t ~== TagOpen tagtype [] && tagtest t)
   mconcat <$> manyTill parser (pCloses tagtype <|> eof)
 
 -- parses p, preceeded by an optional opening tag
@@ -660,7 +739,7 @@ pCloses tagtype = try $ do
        (TagOpen t' _) | t' `closes` tagtype -> return ()
        (TagClose "ul") | tagtype == "li" -> return ()
        (TagClose "ol") | tagtype == "li" -> return ()
-       (TagClose "dl") | tagtype == "li" -> return ()
+       (TagClose "dl") | tagtype == "dd" -> return ()
        (TagClose "table") | tagtype == "td" -> return ()
        (TagClose "table") | tagtype == "tr" -> return ()
        _ -> mzero
@@ -751,7 +830,10 @@ pBad = do
   return $ B.str [c']
 
 pSpace :: InlinesParser Inlines
-pSpace = many1 (satisfy isSpace) >> return B.space
+pSpace = many1 (satisfy isSpace) >>= \xs ->
+            if '\n' `elem` xs
+               then return B.softbreak
+               else return B.space
 
 --
 -- Constants
@@ -833,6 +915,7 @@ isCommentTag = tagComment (const True)
 closes :: String -> String -> Bool
 _ `closes` "body" = False
 _ `closes` "html" = False
+"body" `closes` "head" = True
 "a" `closes` "a" = True
 "li" `closes` "li" = True
 "th" `closes` t | t `elem` ["th","td"] = True
@@ -873,14 +956,45 @@ htmlInBalanced :: (Monad m)
                => (Tag String -> Bool)
                -> ParserT String st m String
 htmlInBalanced f = try $ do
-  (TagOpen t _, tag) <- htmlTag f
-  guard $ '/' `notElem` tag      -- not a self-closing tag
-  let stopper = htmlTag (~== TagClose t)
-  let anytag = snd <$> htmlTag (const True)
-  contents <- many $ notFollowedBy' stopper >>
-                     (htmlInBalanced f <|> anytag <|> count 1 anyChar)
-  endtag <- liftM snd stopper
-  return $ tag ++ concat contents ++ endtag
+  lookAhead (char '<')
+  inp <- getInput
+  let ts = canonicalizeTags $
+        parseTagsOptions parseOptions{ optTagWarning = True,
+                                       optTagPosition = True } inp
+  case ts of
+    (TagPosition sr sc : t@(TagOpen tn _) : rest) -> do
+       guard $ f t
+       guard $ not $ hasTagWarning (t : take 1 rest)
+       case htmlInBalanced' tn (t:rest) of
+            []  -> mzero
+            xs  -> case reverse xs of
+                        (TagClose _ : TagPosition er ec : _) -> do
+                          let ls = er - sr
+                          let cs = ec - sc
+                          lscontents <- unlines <$> count ls anyLine
+                          cscontents <- count cs anyChar
+                          (_,closetag) <- htmlTag (~== TagClose tn)
+                          return (lscontents ++ cscontents ++ closetag)
+                        _ -> mzero
+    _ -> mzero
+
+htmlInBalanced' :: String
+                -> [Tag String]
+                -> [Tag String]
+htmlInBalanced' tagname ts = fromMaybe [] $ go 0 ts
+  where go :: Int -> [Tag String] -> Maybe [Tag String]
+        go n (t@(TagOpen tn' _):rest) | tn' == tagname =
+              (t :) <$> go (n + 1) rest
+        go 1 (t@(TagClose tn'):_) | tn' == tagname =
+              return [t]
+        go n (t@(TagClose tn'):rest)  | tn' == tagname =
+              (t :) <$> go (n - 1) rest
+        go n (t:ts') = (t :) <$> go n ts'
+        go _ [] = mzero
+
+hasTagWarning :: [Tag String] -> Bool
+hasTagWarning (TagWarning _:_) = True
+hasTagWarning _ = False
 
 -- | Matches a tag meeting a certain condition.
 htmlTag :: Monad m
@@ -889,8 +1003,19 @@ htmlTag :: Monad m
 htmlTag f = try $ do
   lookAhead (char '<')
   inp <- getInput
-  let (next : _) = canonicalizeTags $ parseTags inp
+  let (next : _) = canonicalizeTags $ parseTagsOptions
+                       parseOptions{ optTagWarning = False } inp
   guard $ f next
+  let handleTag tagname = do
+       -- <www.boe.es/buscar/act.php?id=BOE-A-1996-8930#a66>
+       -- should NOT be parsed as an HTML tag, see #2277
+       guard $ not ('.' `elem` tagname)
+       -- <https://example.org> should NOT be a tag either.
+       -- tagsoup will parse it as TagOpen "https:" [("example.org","")]
+       guard $ not (null tagname)
+       guard $ last tagname /= ':'
+       rendered <- manyTill anyChar (char '>')
+       return (next, rendered ++ ">")
   case next of
        TagComment s
          | "<!--" `isPrefixOf` inp -> do
@@ -899,9 +1024,9 @@ htmlTag f = try $ do
           char '>'
           return (next, "<!--" ++ s ++ "-->")
          | otherwise -> fail "bogus comment mode, HTML5 parse error"
-       _            -> do
-          rendered <- manyTill anyChar (char '>')
-          return (next, rendered ++ ">")
+       TagOpen tagname _attr -> handleTag tagname
+       TagClose tagname -> handleTag tagname
+       _ -> mzero
 
 mkAttr :: [(String, String)] -> Attr
 mkAttr attr = (attribsId, attribsClasses, attribsKV)
@@ -935,6 +1060,14 @@ isSpace _    = False
 
 -- Instances
 
+instance HasIdentifierList HTMLState where
+  extractIdentifierList = identifiers
+  updateIdentifierList f s = s{ identifiers = f (identifiers s) }
+
+instance HasHeaderMap HTMLState where
+  extractHeaderMap = headerMap
+  updateHeaderMap  f s = s{ headerMap = f (headerMap s) }
+
 -- This signature should be more general
 -- MonadReader HTMLLocal m => HasQuoteContext st m
 instance HasQuoteContext st (Reader HTMLLocal) where
@@ -943,9 +1076,6 @@ instance HasQuoteContext st (Reader HTMLLocal) where
 
 instance HasReaderOptions HTMLState where
     extractReaderOptions = extractReaderOptions . parserState
-
-instance Default HTMLState where
-  def = HTMLState def []
 
 instance HasMeta HTMLState where
   setMeta s b st = st {parserState = setMeta s b $ parserState st}

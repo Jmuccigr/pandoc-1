@@ -26,11 +26,11 @@ noNorm :: Pandoc -> NoNormPandoc
 noNorm = NoNormPandoc
 
 instance ToString NoNormPandoc where
-  toString d = writeNative def{ writerStandalone = s } $ toPandoc d
+  toString d = writeNative def{ writerTemplate = s } $ toPandoc d
    where s = case d of
                   NoNormPandoc (Pandoc (Meta m) _)
-                    | M.null m  -> False
-                    | otherwise -> True
+                    | M.null m  -> Nothing
+                    | otherwise -> Just "" -- need this to get meta output
 
 instance ToPandoc NoNormPandoc where
   toPandoc = unNoNorm
@@ -56,6 +56,19 @@ testCompareWithOpts opts name docxFile nativeFile =
 
 testCompare :: String -> FilePath -> FilePath -> Test
 testCompare = testCompareWithOpts def
+
+testForWarningsWithOptsIO :: ReaderOptions -> String -> FilePath -> [String] -> IO Test
+testForWarningsWithOptsIO opts name docxFile expected = do
+  df <- B.readFile docxFile
+  let (_, _, warns) = handleError $ readDocxWithWarnings opts df
+  return $ test id name (unlines warns, unlines expected)
+
+testForWarningsWithOpts :: ReaderOptions -> String -> FilePath -> [String] -> Test
+testForWarningsWithOpts opts name docxFile expected =
+  buildTest $ testForWarningsWithOptsIO opts name docxFile expected
+
+-- testForWarnings :: String -> FilePath -> [String] -> Test
+-- testForWarnings = testForWarningsWithOpts def
 
 getMedia :: FilePath -> FilePath -> IO (Maybe B.ByteString)
 getMedia archivePath mediaPath = do
@@ -111,6 +124,10 @@ tests = [ testGroup "inlines"
             "docx/links.docx"
             "docx/links.native"
           , testCompare
+            "normalizing adjacent hyperlinks"
+            "docx/adjacent_links.docx"
+            "docx/adjacent_links.native"
+          , testCompare
             "inline image"
             "docx/image.docx"
             "docx/image_no_embed.native"
@@ -130,6 +147,10 @@ tests = [ testGroup "inlines"
             "literal tabs"
             "docx/tabs.docx"
             "docx/tabs.native"
+          , testCompare
+            "special punctuation"
+            "docx/special_punctuation.docx"
+            "docx/special_punctuation.native"
           , testCompare
             "normalizing inlines"
             "docx/normalize.docx"
@@ -161,9 +182,17 @@ tests = [ testGroup "inlines"
             "docx/already_auto_ident.docx"
             "docx/already_auto_ident.native"
           , testCompare
-            "numbered headers automatically made into list"
+            "nested anchor spans in header"
+            "docx/nested_anchors_in_header.docx"
+            "docx/nested_anchors_in_header.native"
+          , testCompare
+            "single numbered item not made into list"
             "docx/numbered_header.docx"
             "docx/numbered_header.native"
+          , testCompare
+            "enumerated headers not made into numbered list"
+            "docx/enumerated_headings.docx"
+            "docx/enumerated_headings.native"
           , testCompare
             "i18n blocks (headers and blockquotes)"
             "docx/i18n_blocks.docx"
@@ -181,9 +210,21 @@ tests = [ testGroup "inlines"
             "docx/german_styled_lists.docx"
             "docx/german_styled_lists.native"
           , testCompare
+            "user deletes bullet after list item (=> part of item par)"
+            "docx/dummy_item_after_list_item.docx"
+            "docx/dummy_item_after_list_item.native"
+          , testCompare
+            "user deletes bullet after par (=> new par)"
+            "docx/dummy_item_after_paragraph.docx"
+            "docx/dummy_item_after_paragraph.native"
+          , testCompare
             "footnotes and endnotes"
             "docx/notes.docx"
             "docx/notes.native"
+          , testCompare
+            "links in footnotes and endnotes"
+            "docx/link_in_notes.docx"
+            "docx/link_in_notes.native"
           , testCompare
             "blockquotes (parsing indent as blockquote)"
             "docx/block_quotes.docx"
@@ -200,6 +241,10 @@ tests = [ testGroup "inlines"
             "tables with lists in cells"
             "docx/table_with_list_cell.docx"
             "docx/table_with_list_cell.native"
+          , testCompare
+            "tables with one row"
+            "docx/table_one_row.docx"
+            "docx/table_one_row.native"
           , testCompare
             "code block"
             "docx/codeblock.docx"
@@ -242,6 +287,42 @@ tests = [ testGroup "inlines"
             "keep deletion (all)"
             "docx/track_changes_deletion.docx"
             "docx/track_changes_deletion_all.native"
+          , testCompareWithOpts def{readerTrackChanges=AcceptChanges}
+            "move text (accept)"
+            "docx/track_changes_move.docx"
+            "docx/track_changes_move_accept.native"
+          , testCompareWithOpts def{readerTrackChanges=RejectChanges}
+            "move text (reject)"
+            "docx/track_changes_move.docx"
+            "docx/track_changes_move_reject.native"
+          , testCompareWithOpts def{readerTrackChanges=AllChanges}
+            "move text (all)"
+            "docx/track_changes_move.docx"
+            "docx/track_changes_move_all.native"
+          , testCompareWithOpts def{readerTrackChanges=AcceptChanges}
+            "comments (accept -- no comments)"
+            "docx/comments.docx"
+            "docx/comments_no_comments.native"
+          , testCompareWithOpts def{readerTrackChanges=RejectChanges}
+            "comments (reject -- comments)"
+            "docx/comments.docx"
+            "docx/comments_no_comments.native"
+          , testCompareWithOpts def{readerTrackChanges=AllChanges}
+            "comments (all comments)"
+            "docx/comments.docx"
+            "docx/comments.native"
+          , testForWarningsWithOpts def{readerTrackChanges=AcceptChanges}
+            "comment warnings (accept -- no warnings)"
+            "docx/comments_warning.docx"
+            []
+          , testForWarningsWithOpts def{readerTrackChanges=RejectChanges}
+            "comment warnings (reject -- no warnings)"
+            "docx/comments_warning.docx"
+            []
+          , testForWarningsWithOpts def{readerTrackChanges=AllChanges}
+            "comment warnings (all)"
+            "docx/comments_warning.docx"
+            ["Docx comment 1 will not retain formatting"]
           ]
         , testGroup "media"
           [ testMediaBag

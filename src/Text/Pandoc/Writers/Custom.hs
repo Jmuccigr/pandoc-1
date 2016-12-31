@@ -44,7 +44,6 @@ import Scripting.Lua (LuaState, StackValue, callfunc)
 import Text.Pandoc.Writers.Shared
 import qualified Scripting.Lua as Lua
 import qualified Text.Pandoc.UTF8 as UTF8
-import Data.Monoid
 import Control.Monad (when)
 import Control.Exception
 import qualified Data.Map as M
@@ -57,18 +56,18 @@ attrToMap (id',classes,keyvals) = M.fromList
     : ("class", unwords classes)
     : keyvals
 
-getList :: StackValue a => LuaState -> Int -> IO [a]
-getList lua i' = do
-  continue <- Lua.next lua i'
-  if continue
-     then do
-       next <- Lua.peek lua (-1)
-       Lua.pop lua 1
-       x <- maybe (fail "peek returned Nothing") return next
-       rest <- getList lua i'
-       return (x : rest)
-     else return []
-
+#if MIN_VERSION_hslua(0,4,0)
+#if MIN_VERSION_base(4,8,0)
+instance {-# OVERLAPS #-} StackValue [Char] where
+#else
+instance StackValue [Char] where
+#endif
+  push lua cs = Lua.push lua (UTF8.fromString cs)
+  peek lua i = do
+                 res <- Lua.peek lua i
+                 return $ UTF8.toString `fmap` res
+  valuetype _ = Lua.TSTRING
+#else
 #if MIN_VERSION_base(4,8,0)
 instance {-# OVERLAPS #-} StackValue a => StackValue [a] where
 #else
@@ -86,6 +85,19 @@ instance StackValue a => StackValue [a] where
     Lua.pop lua 1
     return (Just lst)
   valuetype _ = Lua.TTABLE
+
+getList :: StackValue a => LuaState -> Int -> IO [a]
+getList lua i' = do
+  continue <- Lua.next lua i'
+  if continue
+     then do
+       next <- Lua.peek lua (-1)
+       Lua.pop lua 1
+       x <- maybe (fail "peek returned Nothing") return next
+       rest <- getList lua i'
+       return (x : rest)
+     else return []
+#endif
 
 instance StackValue Format where
   push lua (Format f) = Lua.push lua (map toLower f)
@@ -111,12 +123,20 @@ instance (StackValue a, StackValue b) => StackValue (a,b) where
   peek _ _ = undefined -- not needed for our purposes
   valuetype _ = Lua.TTABLE
 
+#if MIN_VERSION_base(4,8,0)
+instance {-# OVERLAPS #-} StackValue [Inline] where
+#else
 instance StackValue [Inline] where
+#endif
   push l ils = Lua.push l =<< inlineListToCustom l ils
   peek _ _ = undefined
   valuetype _ = Lua.TSTRING
 
+#if MIN_VERSION_base(4,8,0)
+instance {-# OVERLAPS #-} StackValue [Block] where
+#else
 instance StackValue [Block] where
+#endif
   push l ils = Lua.push l =<< blockListToCustom l ils
   peek _ _ = undefined
   valuetype _ = Lua.TSTRING
@@ -167,7 +187,11 @@ writeCustom luaFile opts doc@(Pandoc meta _) = do
   -- check for error in lua script (later we'll change the return type
   -- to handle this more gracefully):
   when (status /= 0) $
+#if MIN_VERSION_hslua(0,4,0)
+    Lua.tostring lua 1 >>= throw . PandocLuaException . UTF8.toString
+#else
     Lua.tostring lua 1 >>= throw . PandocLuaException
+#endif
   Lua.call lua 0 0
   -- TODO - call hierarchicalize, so we have that info
   rendered <- docToCustom lua opts doc
@@ -178,11 +202,9 @@ writeCustom luaFile opts doc@(Pandoc meta _) = do
   Lua.close lua
   setForeignEncoding enc
   let body = rendered
-  if writerStandalone opts
-     then do
-       let context' = setField "body" body context
-       return $ renderTemplate' (writerTemplate opts) context'
-     else return body
+  case writerTemplate opts of
+       Nothing  -> return body
+       Just tpl -> return $ renderTemplate' tpl $ setField "body" body context
 
 docToCustom :: LuaState -> WriterOptions -> Pandoc -> IO String
 docToCustom lua opts (Pandoc (Meta metamap) blocks) = do
@@ -198,10 +220,12 @@ blockToCustom _ Null = return ""
 
 blockToCustom lua (Plain inlines) = callfunc lua "Plain" inlines
 
-blockToCustom lua (Para [Image txt (src,tit)]) =
-  callfunc lua "CaptionedImage" src tit txt
+blockToCustom lua (Para [Image attr txt (src,tit)]) =
+  callfunc lua "CaptionedImage" src tit txt (attrToMap attr)
 
 blockToCustom lua (Para inlines) = callfunc lua "Para" inlines
+
+blockToCustom lua (LineBlock linesList) = callfunc lua "LineBlock" linesList
 
 blockToCustom lua (RawBlock format str) =
   callfunc lua "RawBlock" format str
@@ -252,6 +276,8 @@ inlineToCustom lua (Str str) = callfunc lua "Str" str
 
 inlineToCustom lua Space = callfunc lua "Space"
 
+inlineToCustom lua SoftBreak = callfunc lua "SoftBreak"
+
 inlineToCustom lua (Emph lst) = callfunc lua "Emph" lst
 
 inlineToCustom lua (Strong lst) = callfunc lua "Strong" lst
@@ -284,11 +310,11 @@ inlineToCustom lua (RawInline format str) =
 
 inlineToCustom lua (LineBreak) = callfunc lua "LineBreak"
 
-inlineToCustom lua (Link txt (src,tit)) =
-  callfunc lua "Link" txt src tit
+inlineToCustom lua (Link attr txt (src,tit)) =
+  callfunc lua "Link" txt src tit (attrToMap attr)
 
-inlineToCustom lua (Image alt (src,tit)) =
-  callfunc lua "Image" alt src tit
+inlineToCustom lua (Image attr alt (src,tit)) =
+  callfunc lua "Image" alt src tit (attrToMap attr)
 
 inlineToCustom lua (Note contents) = callfunc lua "Note" contents
 

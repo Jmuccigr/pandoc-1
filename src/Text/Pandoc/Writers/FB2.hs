@@ -46,7 +46,8 @@ import qualified Text.XML.Light.Cursor as XC
 
 import Text.Pandoc.Definition
 import Text.Pandoc.Options (WriterOptions(..), HTMLMathMethod(..), def)
-import Text.Pandoc.Shared (orderedListMarkers, isHeaderBlock, capitalize)
+import Text.Pandoc.Shared (orderedListMarkers, isHeaderBlock, capitalize,
+                           linesToPara)
 
 -- | Data to be written at the end of the document:
 -- (foot)notes, URLs, references, images.
@@ -76,7 +77,7 @@ writeFB2 :: WriterOptions    -- ^ conversion options
          -> Pandoc           -- ^ document to convert
          -> IO String        -- ^ FictionBook2 document (not encoded yet)
 writeFB2 opts (Pandoc meta blocks) = flip evalStateT newFB $ do
-     modify (\s -> s { writerOptions = opts { writerStandalone = True } })
+     modify (\s -> s { writerOptions = opts })
      desc <- description meta
      fp <- frontpage meta
      secs <- renderSections 1 blocks
@@ -314,8 +315,8 @@ blockToXml :: Block -> FBM [Content]
 blockToXml (Plain ss) = cMapM toXml ss  -- FIXME: can lead to malformed FB2
 blockToXml (Para [Math DisplayMath formula]) = insertMath NormalImage formula
 -- title beginning with fig: indicates that the image is a figure
-blockToXml (Para [Image alt (src,'f':'i':'g':':':tit)]) =
-  insertImage NormalImage (Image alt (src,tit))
+blockToXml (Para [Image atr alt (src,'f':'i':'g':':':tit)]) =
+  insertImage NormalImage (Image atr alt (src,tit))
 blockToXml (Para ss) = liftM (list . el "p") $ cMapM toXml ss
 blockToXml (CodeBlock _ s) = return . spaceBeforeAfter .
                              map (el "p" . el "code") . lines $ s
@@ -323,6 +324,7 @@ blockToXml (RawBlock _ s) = return . spaceBeforeAfter .
                             map (el "p" . el "code") . lines $ s
 blockToXml (Div _ bs) = cMapM blockToXml bs
 blockToXml (BlockQuote bs) = liftM (list . el "cite") $ cMapM blockToXml bs
+blockToXml (LineBlock lns) = blockToXml $ linesToPara lns
 blockToXml (OrderedList a bss) = do
     state <- get
     let pmrk = parentListMarker state
@@ -439,10 +441,11 @@ toXml (Quoted DoubleQuote ss) = do
 toXml (Cite _ ss) = cMapM toXml ss  -- FIXME: support citation styles
 toXml (Code _ s) = return [el "code" s]
 toXml Space = return [txt " "]
+toXml SoftBreak = return [txt " "]
 toXml LineBreak = return [el "empty-line" ()]
 toXml (Math _ formula) = insertMath InlineImage formula
 toXml (RawInline _ _) = return []  -- raw TeX and raw HTML are suppressed
-toXml (Link text (url,ttl)) = do
+toXml (Link _ text (url,ttl)) = do
   fns <- footnotes `liftM` get
   let n = 1 + length fns
   let ln_id = linkID n
@@ -459,7 +462,7 @@ toXml (Link text (url,ttl)) = do
                   ( [ attr ("l","href") ('#':ln_id)
                     , uattr "type" "note" ]
                   , ln_ref) ]
-toXml img@(Image _ _) = insertImage InlineImage img
+toXml img@(Image _ _ _) = insertImage InlineImage img
 toXml (Note bs) = do
   fns <- footnotes `liftM` get
   let n = 1 + length fns
@@ -478,12 +481,12 @@ insertMath immode formula = do
     WebTeX url -> do
        let alt = [Code nullAttr formula]
        let imgurl = url ++ urlEncode formula
-       let img = Image alt (imgurl, "")
+       let img = Image nullAttr alt (imgurl, "")
        insertImage immode img
     _ -> return [el "code" formula]
 
 insertImage :: ImageMode -> Inline -> FBM [Content]
-insertImage immode (Image alt (url,ttl)) = do
+insertImage immode (Image _ alt (url,ttl)) = do
   images <- imagesToFetch `liftM` get
   let n = 1 + length images
   let fname = "image" ++ show n
@@ -569,11 +572,12 @@ plain (Quoted _ ss) = concat (map plain ss)
 plain (Cite _ ss) = concat (map plain ss)  -- FIXME
 plain (Code _ s) = s
 plain Space = " "
+plain SoftBreak = " "
 plain LineBreak = "\n"
 plain (Math _ s) = s
 plain (RawInline _ s) = s
-plain (Link text (url,_)) = concat (map plain text ++ [" <", url, ">"])
-plain (Image alt _) = concat (map plain alt)
+plain (Link _ text (url,_)) = concat (map plain text ++ [" <", url, ">"])
+plain (Image _ alt _) = concat (map plain alt)
 plain (Note _) = ""  -- FIXME
 
 -- | Create an XML element.

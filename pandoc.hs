@@ -1,6 +1,6 @@
-{-# LANGUAGE CPP, TupleSections #-}
+{-# LANGUAGE CPP, TupleSections, ScopedTypeVariables, PatternGuards #-}
 {-
-Copyright (C) 2006-2015 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2016 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Main
-   Copyright   : Copyright (C) 2006-2015 John MacFarlane
+   Copyright   : Copyright (C) 2006-2016 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley@edu>
@@ -42,14 +42,15 @@ import Text.Pandoc.MediaBag ( mediaDirectory, extractMediaBag, MediaBag )
 import Text.Pandoc.XML ( toEntities )
 import Text.Pandoc.SelfContained ( makeSelfContained )
 import Text.Pandoc.Process (pipeProcess)
-import Text.Highlighting.Kate ( languages, Style, tango, pygments,
+import Skylighting ( defaultSyntaxMap, Syntax(..), Style, tango, pygments,
          espresso, zenburn, kate, haddock, monochrome )
-import System.Environment ( getArgs, getProgName )
-import System.Exit ( exitWith, ExitCode (..) )
+import System.Environment ( getArgs, getProgName, getEnvironment )
+import System.Exit ( ExitCode (..), exitSuccess )
 import System.FilePath
 import System.Console.GetOpt
-import Data.Char ( toLower )
-import Data.List ( delete, intercalate, isPrefixOf, isSuffixOf, sort )
+import qualified Data.Set as Set
+import Data.Char ( toLower, toUpper )
+import Data.List ( intercalate, isPrefixOf, isSuffixOf, sort )
 import System.Directory ( getAppUserDataDirectory, findExecutable,
                           doesFileExist, Permissions(..), getPermissions )
 import System.IO ( stdout, stderr )
@@ -58,7 +59,7 @@ import qualified Control.Exception as E
 import Control.Exception.Extensible ( throwIO )
 import qualified Text.Pandoc.UTF8 as UTF8
 import Control.Monad (when, unless, (>=>))
-import Data.Maybe (isJust, fromMaybe)
+import Data.Maybe (fromMaybe, isNothing, isJust)
 import Data.Foldable (foldrM)
 import Network.URI (parseURI, isURI, URI(..))
 import qualified Data.ByteString.Lazy as B
@@ -68,30 +69,30 @@ import qualified Data.Map as M
 import Data.Yaml (decode)
 import qualified Data.Yaml as Yaml
 import qualified Data.Text as T
-import Control.Applicative ((<$>), (<|>))
+import Control.Applicative ((<|>))
 import Text.Pandoc.Readers.Txt2Tags (getT2TMeta)
-import Data.Monoid
-
-import Text.Pandoc.Error
+import Paths_pandoc (getDataDir)
+import Text.Printf (printf)
+#ifndef _WINDOWS
+import System.Posix.Terminal (queryTerminal)
+import System.Posix.IO (stdOutput)
+#endif
 
 type Transform = Pandoc -> Pandoc
 
 copyrightMessage :: String
 copyrightMessage = intercalate "\n" [
   "",
-  "Copyright (C) 2006-2015 John MacFarlane",
-  "Web:  http://johnmacfarlane.net/pandoc",
+  "Copyright (C) 2006-2016 John MacFarlane",
+  "Web:  http://pandoc.org",
   "This is free software; see the source for copying conditions.",
   "There is no warranty, not even for merchantability or fitness",
   "for a particular purpose." ]
 
 compileInfo :: String
 compileInfo =
-  "\nCompiled with texmath " ++
-  VERSION_texmath ++ ", highlighting-kate " ++ VERSION_highlighting_kate ++
-   ".\nSyntax highlighting is supported for the following languages:\n    " ++
-       wrapWords 4 78
-       [map toLower l | l <- languages, l /= "Alert" && l /= "Alert_indent"]
+  "\nCompiled with pandoc-types " ++ VERSION_pandoc_types ++ ", texmath " ++
+  VERSION_texmath ++ ", skylighting " ++ VERSION_skylighting
 
 -- | Converts a list of strings into a single string with the items printed as
 -- comma separated words in lines with a maximum line length.
@@ -110,47 +111,52 @@ wrapWords indent c = wrap' (c - indent) (c - indent)
             wrap' cols (remaining - length x - 2) xs
 
 isTextFormat :: String -> Bool
-isTextFormat s = takeWhile (`notElem` "+-") s `notElem` binaries
-  where binaries = ["odt","docx","epub","epub3"]
+isTextFormat s = s `notElem` ["odt","docx","epub","epub3"]
 
 externalFilter :: FilePath -> [String] -> Pandoc -> IO Pandoc
 externalFilter f args' d = do
-      mbexe <- if '/' `elem` f
-                  -- don't check PATH if filter name has a path
-                  then return Nothing
-                  -- we catch isDoesNotExistError because this will
-                  -- be triggered if PATH not set:
-                  else E.catch (findExecutable f)
-                                 (\e -> if isDoesNotExistError e
-                                           then return Nothing
-                                           else throwIO e)
-      (f', args'') <- case mbexe of
-                           Just x  -> return (x, args')
-                           Nothing -> do
-                             exists <- doesFileExist f
-                             if exists
-                                then do
-                                  isExecutable <- executable `fmap`
-                                                    getPermissions f
-                                  return $
-                                    case map toLower $ takeExtension f of
-                                         _ | isExecutable -> (f, args')
-                                         ".py"  -> ("python", f:args')
-                                         ".hs"  -> ("runhaskell", f:args')
-                                         ".pl"  -> ("perl", f:args')
-                                         ".rb"  -> ("ruby", f:args')
-                                         ".php" -> ("php", f:args')
-                                         _      -> (f, args')
-                                else err 85 $ "Filter " ++ f ++ " not found"
-      (exitcode, outbs, errbs) <- E.handle filterException $
-                                    pipeProcess Nothing f' args'' $ encode d
-      when (not $ B.null errbs) $ B.hPutStr stderr errbs
-      case exitcode of
-           ExitSuccess    -> return $ either error id $ eitherDecode' outbs
-           ExitFailure _  -> err 83 $ "Error running filter " ++ f
+  exists <- doesFileExist f
+  isExecutable <- if exists
+                     then executable <$> getPermissions f
+                     else return True
+  let (f', args'') = if exists
+                        then case map toLower (takeExtension f) of
+                                  _ | isExecutable -> ("." </> f, args')
+                                  ".py"  -> ("python", f:args')
+                                  ".hs"  -> ("runhaskell", f:args')
+                                  ".pl"  -> ("perl", f:args')
+                                  ".rb"  -> ("ruby", f:args')
+                                  ".php" -> ("php", f:args')
+                                  ".js"  -> ("node", f:args')
+                                  _      -> (f, args')
+                        else (f, args')
+  unless (exists && isExecutable) $ do
+    mbExe <- findExecutable f'
+    when (isNothing mbExe) $
+      err 83 $ "Error running filter " ++ f ++  ":\n" ++
+               "Could not find executable '" ++ f' ++ "'."
+  env <- getEnvironment
+  let env' = Just $ ("PANDOC_VERSION", pandocVersion) : env
+  (exitcode, outbs, errbs) <- E.handle filterException $
+                              pipeProcess env' f' args'' $ encode d
+  unless (B.null errbs) $ B.hPutStr stderr errbs
+  case exitcode of
+       ExitSuccess    -> return $ either error id $ eitherDecode' outbs
+       ExitFailure ec -> err 83 $ "Error running filter " ++ f ++ "\n" ++
+                                  "Filter returned error status " ++ show ec
  where filterException :: E.SomeException -> IO a
        filterException e = err 83 $ "Error running filter " ++ f ++ "\n" ++
                                        show e
+
+highlightingStyles :: [(String, Style)]
+highlightingStyles =
+  [("pygments", pygments),
+   ("tango", tango),
+   ("espresso", espresso),
+   ("zenburn", zenburn),
+   ("kate", kate),
+   ("monochrome", monochrome),
+   ("haddock", haddock)]
 
 -- | Data structure for command line options.
 data Opt = Opt
@@ -177,7 +183,7 @@ data Opt = Opt
     , optHtmlQTags         :: Bool    -- ^ Use <q> tags in HTML
     , optHighlight         :: Bool    -- ^ Highlight source code
     , optHighlightStyle    :: Style   -- ^ Style to use for highlighted code
-    , optChapters          :: Bool    -- ^ Use chapter for top-level sects
+    , optTopLevelDivision  :: TopLevelDivision -- ^ Type of the top-level divisions
     , optHTMLMathMethod    :: HTMLMathMethod -- ^ Method to print HTML math
     , optReferenceODT      :: Maybe FilePath -- ^ Path of reference.odt
     , optReferenceDocx     :: Maybe FilePath -- ^ Path of reference.docx
@@ -190,7 +196,9 @@ data Opt = Opt
     , optIgnoreArgs        :: Bool    -- ^ Ignore command-line arguments
     , optVerbose           :: Bool    -- ^ Verbose diagnostic output
     , optReferenceLinks    :: Bool    -- ^ Use reference links in writing markdown, rst
-    , optWrapText          :: Bool    -- ^ Wrap text
+    , optReferenceLocation :: ReferenceLocation -- ^ location for footnotes and link references in markdown output
+    , optDpi               :: Int     -- ^ Dpi
+    , optWrapText          :: WrapOption  -- ^ Options for wrapping text
     , optColumns           :: Int     -- ^ Line length in characters
     , optFilters           :: [FilePath] -- ^ Filters to apply
     , optEmailObfuscation  :: ObfuscationMethod
@@ -209,6 +217,7 @@ data Opt = Opt
     , optExtractMedia      :: Maybe FilePath -- ^ Path to extract embedded media
     , optTrace             :: Bool       -- ^ Print debug information
     , optTrackChanges      :: TrackChanges -- ^ Accept or reject MS Word track-changes.
+    , optFileScope        :: Bool         -- ^ Parse input files before combining
     , optKaTeXStylesheet   :: Maybe String     -- ^ Path to stylesheet for KaTeX
     , optKaTeXJS           :: Maybe String     -- ^ Path to js file for KaTeX
     }
@@ -239,7 +248,7 @@ defaultOpts = Opt
     , optHtmlQTags             = False
     , optHighlight             = True
     , optHighlightStyle        = pygments
-    , optChapters              = False
+    , optTopLevelDivision      = TopLevelDefault
     , optHTMLMathMethod        = PlainMath
     , optReferenceODT          = Nothing
     , optReferenceDocx         = Nothing
@@ -252,10 +261,12 @@ defaultOpts = Opt
     , optIgnoreArgs            = False
     , optVerbose               = False
     , optReferenceLinks        = False
-    , optWrapText              = True
+    , optReferenceLocation     = EndOfDocument
+    , optDpi                   = 96
+    , optWrapText              = WrapAuto
     , optColumns               = 72
     , optFilters               = []
-    , optEmailObfuscation      = JavascriptObfuscation
+    , optEmailObfuscation      = NoObfuscation
     , optIdentifierPrefix      = ""
     , optIndentedCodeClasses   = []
     , optDataDir               = Nothing
@@ -271,6 +282,7 @@ defaultOpts = Opt
     , optExtractMedia          = Nothing
     , optTrace                 = False
     , optTrackChanges          = AcceptChanges
+    , optFileScope            = False
     , optKaTeXStylesheet       = Nothing
     , optKaTeXJS               = Nothing
     }
@@ -302,14 +314,6 @@ options =
                   (\arg opt -> return opt { optDataDir = Just arg })
                  "DIRECTORY") -- "Directory containing pandoc data files."
                 ""
-
-    , Option "" ["strict"]
-                 (NoArg
-                  (\opt -> do
-                      err 59 $ "The --strict option has been removed.\n" ++
-                               "Use `markdown_strict' input or output format instead."
-                      return opt ))
-                 "" -- "Disable markdown syntax extensions"
 
     , Option "R" ["parse-raw"]
                  (NoArg
@@ -388,9 +392,14 @@ options =
                   "accept|reject|all")
                  "" -- "Accepting or reject MS Word track-changes.""
 
+    , Option "" ["file-scope"]
+                 (NoArg
+                  (\opt -> return opt { optFileScope = True }))
+                 "" -- "Parse input files before combining"
+
     , Option "" ["extract-media"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                     return opt { optExtractMedia = Just arg })
                   "PATH")
                  "" -- "Directory to which to extract embedded media"
@@ -402,7 +411,7 @@ options =
 
     , Option "" ["template"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                      return opt{ optTemplate = Just arg,
                                  optStandalone = True })
                   "FILENAME")
@@ -436,7 +445,7 @@ options =
                      case templ of
                           Right t -> UTF8.hPutStr stdout t
                           Left e  -> error $ show e
-                     exitWith ExitSuccess)
+                     exitSuccess)
                   "FORMAT")
                  "" -- "Print default template for FORMAT"
 
@@ -444,21 +453,42 @@ options =
                  (ReqArg
                   (\arg _ -> do
                      readDataFile Nothing arg >>= BS.hPutStr stdout
-                     exitWith ExitSuccess)
+                     exitSuccess)
                   "FILE")
                   "" -- "Print default data file"
 
+    , Option "" ["dpi"]
+                 (ReqArg
+                  (\arg opt ->
+                    case safeRead arg of
+                         Just t | t > 0 -> return opt { optDpi = t }
+                         _              -> err 31
+                                        "dpi must be a number greater than 0")
+                  "NUMBER")
+                 "" -- "Dpi (default 96)"
+
     , Option "" ["no-wrap"]
                  (NoArg
-                  (\opt -> return opt { optWrapText = False }))
-                 "" -- "Do not wrap text in output"
+                  (\opt -> do warn $ "--no-wrap is deprecated. " ++
+                                     "Use --wrap=none or --wrap=preserve instead."
+                              return opt { optWrapText = WrapNone }))
+                 ""
+
+    , Option "" ["wrap"]
+                 (ReqArg
+                  (\arg opt ->
+                    case safeRead ("Wrap" ++ uppercaseFirstLetter arg) of
+                          Just o   -> return opt { optWrapText = o }
+                          Nothing  -> err 77 "--wrap must be auto, none, or preserve")
+                 "auto|none|preserve")
+                 "" -- "Option for wrapping text in output"
 
     , Option "" ["columns"]
                  (ReqArg
                   (\arg opt ->
                       case safeRead arg of
                            Just t | t > 0 -> return opt { optColumns = t }
-                           _              -> err 33 $
+                           _              -> err 33
                                    "columns must be a number greater than 0")
                  "NUMBER")
                  "" -- "Length of line in characters"
@@ -470,11 +500,11 @@ options =
 
     , Option "" ["toc-depth"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                       case safeRead arg of
                            Just t | t >= 1 && t <= 6 ->
                                     return opt { optTOCDepth = t }
-                           _      -> err 57 $
+                           _      -> err 57
                                     "TOC level must be a number between 1 and 6")
                  "NUMBER")
                  "" -- "Number of levels to include in TOC"
@@ -487,17 +517,9 @@ options =
     , Option "" ["highlight-style"]
                 (ReqArg
                  (\arg opt -> do
-                   newStyle <- case map toLower arg of
-                                     "pygments"   -> return pygments
-                                     "tango"      -> return tango
-                                     "espresso"   -> return espresso
-                                     "zenburn"    -> return zenburn
-                                     "kate"       -> return kate
-                                     "monochrome" -> return monochrome
-                                     "haddock"    -> return haddock
-                                     _            -> err 39 $
-                                         "Unknown style :" ++ arg
-                   return opt{ optHighlightStyle = newStyle })
+                   case lookup (map toLower arg) highlightingStyles of
+                         Just s -> return opt{ optHighlightStyle = s }
+                         Nothing -> err 39 $ "Unknown style: " ++ arg)
                  "STYLE")
                  "" -- "Style for highlighted code"
 
@@ -540,25 +562,9 @@ options =
                                         optStandalone = True }))
                  "" -- "Make slide shows include all the needed js and css"
 
-    , Option "" ["offline"]
-                 (NoArg
-                  (\opt -> do warn $ "--offline is deprecated. Use --self-contained instead."
-                              return opt { optSelfContained = True,
-                                           optStandalone = True }))
-                 "" -- "Make slide shows include all the needed js and css"
-                 -- deprecated synonym for --self-contained
-
-    , Option "5" ["html5"]
-                 (NoArg
-                  (\opt -> do
-                     warn $ "--html5 is deprecated. "
-                       ++ "Use the html5 output format instead."
-                     return opt { optHtml5 = True }))
-                 "" -- "Produce HTML5 in HTML output"
-
     , Option "" ["html-q-tags"]
                  (NoArg
-                  (\opt -> do
+                  (\opt ->
                      return opt { optHtmlQTags = True }))
                  "" -- "Use <q> tags for quotes in HTML"
 
@@ -572,6 +578,19 @@ options =
                   (\opt -> return opt { optReferenceLinks = True } ))
                  "" -- "Use reference links in parsing HTML"
 
+    , Option "" ["reference-location"]
+                 (ReqArg
+                  (\arg opt -> do
+                     action <- case arg of
+                            "block"    -> return EndOfBlock
+                            "section"  -> return EndOfSection
+                            "document" -> return EndOfDocument
+                            _        -> err 6
+                               ("Unknown option for reference-location: " ++ arg)
+                     return opt { optReferenceLocation = action })
+                  "block|section|document")
+                 "" -- "Accepting or reject MS Word track-changes.""
+
     , Option "" ["atx-headers"]
                  (NoArg
                   (\opt -> return opt { optSetextHeaders = False } ))
@@ -579,8 +598,21 @@ options =
 
     , Option "" ["chapters"]
                  (NoArg
-                  (\opt -> return opt { optChapters = True }))
+                  (\opt -> do warn $ "--chapters is deprecated. " ++
+                                     "Use --top-level-division=chapter instead."
+                              return opt { optTopLevelDivision = TopLevelChapter }))
                  "" -- "Use chapter for top-level sections in LaTeX, DocBook"
+
+    , Option "" ["top-level-division"]
+                 (ReqArg
+                  (\arg opt -> do
+                      let tldName = "TopLevel" ++ uppercaseFirstLetter arg
+                      case safeRead tldName of
+                        Just tlDiv -> return opt { optTopLevelDivision = tlDiv }
+                        _       -> err 76 ("Top-level division must be " ++
+                                           "section,  chapter, part, or default"))
+                   "section|chapter|part")
+                 "" -- "Use top-level division type in LaTeX, ConTeXt, DocBook"
 
     , Option "N" ["number-sections"]
                  (NoArg
@@ -614,11 +646,11 @@ options =
 
     , Option "" ["slide-level"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                       case safeRead arg of
                            Just t | t >= 1 && t <= 6 ->
                                     return opt { optSlideLevel = Just t }
-                           _      -> err 39 $
+                           _      -> err 39
                                     "slide level must be a number between 1 and 6")
                  "NUMBER")
                  "" -- "Force header level for slides"
@@ -674,14 +706,14 @@ options =
 
     , Option "" ["reference-odt"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                     return opt { optReferenceODT = Just arg })
                   "FILENAME")
                  "" -- "Path of custom reference.odt"
 
     , Option "" ["reference-docx"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                     return opt { optReferenceDocx = Just arg })
                   "FILENAME")
                  "" -- "Path of custom reference.docx"
@@ -712,18 +744,18 @@ options =
 
     , Option "" ["epub-embed-font"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                      return opt{ optEpubFonts = arg : optEpubFonts opt })
                   "FILE")
                  "" -- "Directory of fonts to embed"
 
     , Option "" ["epub-chapter-level"]
                  (ReqArg
-                  (\arg opt -> do
+                  (\arg opt ->
                       case safeRead arg of
                            Just t | t >= 1 && t <= 6 ->
                                     return opt { optEpubChapterLevel = t }
-                           _      -> err 59 $
+                           _      -> err 59
                                     "chapter level must be a number between 1 and 6")
                  "NUMBER")
                  "" -- "Header level at which to split chapters in EPUB"
@@ -751,9 +783,6 @@ options =
                   (\arg opt -> return opt{ optMetadata = addMetadata
                                              "bibliography" (readMetaValue arg)
                                              $ optMetadata opt
-                                         , optVariables =
-                                            ("biblio-files", dropExtension arg) :
-                                            optVariables opt
                                          })
                    "FILE")
                  ""
@@ -814,9 +843,7 @@ options =
     , Option "" ["webtex"]
                  (OptArg
                   (\arg opt -> do
-                      let url' = case arg of
-                                      Just u   -> u
-                                      Nothing  -> "http://chart.apis.google.com/chart?cht=tx&chl="
+                      let url' = fromMaybe "https://latex.codecogs.com/png.latex?" arg
                       return opt { optHTMLMathMethod = WebTeX url' })
                   "URL")
                  "" -- "Use web service for HTML math"
@@ -830,9 +857,7 @@ options =
     , Option "" ["mathjax"]
                  (OptArg
                   (\arg opt -> do
-                      let url' = case arg of
-                                      Just u   -> u
-                                      Nothing  -> "//cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML"
+                      let url' = fromMaybe "https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS_CHTML-full" arg
                       return opt { optHTMLMathMethod = MathJax url'})
                   "URL")
                  "" -- "Use MathJax for HTML math"
@@ -841,7 +866,7 @@ options =
                   (\arg opt ->
                       return opt
                         { optKaTeXJS =
-                           arg <|> Just "http://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.1.0/katex.min.js"})
+                           arg <|> Just "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.6.0/katex.min.js"})
                   "URL")
                   "" -- Use KaTeX for HTML Math
 
@@ -877,15 +902,83 @@ options =
                   (\opt -> return opt { optVerbose = True }))
                  "" -- "Verbose diagnostic output."
 
+    , Option "" ["bash-completion"]
+                 (NoArg
+                  (\_ -> do
+                     ddir <- getDataDir
+                     tpl <- readDataFileUTF8 Nothing "bash_completion.tpl"
+                     let optnames (Option shorts longs _ _) =
+                           map (\c -> ['-',c]) shorts ++
+                           map ("--" ++) longs
+                     let allopts = unwords (concatMap optnames options)
+                     UTF8.hPutStrLn stdout $ printf tpl allopts
+                         (unwords (map fst readers))
+                         (unwords (map fst writers))
+                         (unwords $ map fst highlightingStyles)
+                         ddir
+                     exitSuccess ))
+                 "" -- "Print bash completion script"
+
+    , Option "" ["list-input-formats"]
+                 (NoArg
+                  (\_ -> do
+                     let readers'names = sort (map fst readers)
+                     mapM_ (UTF8.hPutStrLn stdout) readers'names
+                     exitSuccess ))
+                 ""
+
+    , Option "" ["list-output-formats"]
+                 (NoArg
+                  (\_ -> do
+                     let writers'names = sort (map fst writers)
+                     mapM_ (UTF8.hPutStrLn stdout) writers'names
+                     exitSuccess ))
+                 ""
+
+    , Option "" ["list-extensions"]
+                 (NoArg
+                  (\_ -> do
+                     let showExt x = drop 4 (show x) ++
+                                       if x `Set.member` pandocExtensions
+                                          then " +"
+                                          else " -"
+                     mapM_ (UTF8.hPutStrLn stdout . showExt)
+                               ([minBound..maxBound] :: [Extension])
+                     exitSuccess ))
+                 ""
+
+    , Option "" ["list-highlight-languages"]
+                 (NoArg
+                  (\_ -> do
+                     let langs = [ T.unpack (T.toLower (sShortname s))
+                                 | s <- M.elems defaultSyntaxMap
+                                 , sShortname s `notElem`
+                                    [T.pack "Alert", T.pack "Alert_indent"]
+                                 ]
+                     mapM_ (UTF8.hPutStrLn stdout) langs
+                     exitSuccess ))
+                 ""
+
+    , Option "" ["list-highlight-styles"]
+                 (NoArg
+                  (\_ -> do
+                     mapM_ (UTF8.hPutStrLn stdout) $
+                           map fst highlightingStyles
+                     exitSuccess ))
+                 ""
+
     , Option "v" ["version"]
                  (NoArg
                   (\_ -> do
                      prg <- getProgName
-                     defaultDatadir <- getAppUserDataDirectory "pandoc"
+                     defaultDatadir <- E.catch
+                            (getAppUserDataDirectory "pandoc")
+                            (\e -> let _ = (e :: E.SomeException)
+                                   in  return "")
                      UTF8.hPutStrLn stdout (prg ++ " " ++ pandocVersion ++
                        compileInfo ++ "\nDefault user data directory: " ++
                        defaultDatadir ++ copyrightMessage)
-                     exitWith ExitSuccess ))
+                     exitSuccess ))
                  "" -- "Print version"
 
     , Option "h" ["help"]
@@ -893,7 +986,7 @@ options =
                   (\_ -> do
                      prg <- getProgName
                      UTF8.hPutStr stdout (usageMessage prg options)
-                     exitWith ExitSuccess ))
+                     exitSuccess ))
                  "" -- "Show help"
 
     ]
@@ -915,17 +1008,7 @@ readMetaValue s = case decode (UTF8.fromString s) of
 
 -- Returns usage message
 usageMessage :: String -> [OptDescr (Opt -> IO Opt)] -> String
-usageMessage programName = usageInfo
-  (programName ++ " [OPTIONS] [FILES]" ++ "\nInput formats:  " ++
-  (wrapWords 16 78 $ readers'names) ++ 
-     '\n' : replicate 16 ' ' ++
-     "[ *only Pandoc's JSON version of native AST]" ++ "\nOutput formats: " ++
-  (wrapWords 16 78 $ writers'names) ++
-     '\n' : replicate 16 ' ' ++
-     "[**for pdf output, use latex or beamer and -o FILENAME.pdf]\nOptions:")
-  where
-    writers'names = sort $ "json*" : "pdf**" : delete "json" (map fst writers)
-    readers'names = sort $ "json*" : delete "json" (map fst readers)
+usageMessage programName = usageInfo (programName ++ " [OPTIONS] [FILES]")
 
 -- Determine default reader based on source file extensions
 defaultReaderName :: String -> [FilePath] -> String
@@ -935,6 +1018,8 @@ defaultReaderName fallback (x:xs) =
     ".xhtml"    -> "html"
     ".html"     -> "html"
     ".htm"      -> "html"
+    ".md"       -> "markdown"
+    ".markdown" -> "markdown"
     ".tex"      -> "latex"
     ".latex"    -> "latex"
     ".ltx"      -> "latex"
@@ -951,7 +1036,7 @@ defaultReaderName fallback (x:xs) =
     ".docx"     -> "docx"
     ".t2t"      -> "t2t"
     ".epub"     -> "epub"
-    ".odt"      -> "odt"  -- so we get an "unknown reader" error
+    ".odt"      -> "odt"
     ".pdf"      -> "pdf"  -- so we get an "unknown reader" error
     ".doc"      -> "doc"  -- so we get an "unknown reader" error
     _           -> defaultReaderName fallback xs
@@ -991,10 +1076,13 @@ defaultWriterName x =
     ".epub"     -> "epub"
     ".org"      -> "org"
     ".asciidoc" -> "asciidoc"
+    ".adoc"     -> "asciidoc"
     ".pdf"      -> "latex"
     ".fb2"      -> "fb2"
     ".opml"     -> "opml"
     ".icml"     -> "icml"
+    ".tei.xml"  -> "tei"
+    ".tei"      -> "tei"
     ['.',y] | y `elem` ['1'..'9'] -> "man"
     _           -> "html"
 
@@ -1009,8 +1097,8 @@ extractMedia media dir d =
           return $ walk (adjustImagePath dir fps) d
 
 adjustImagePath :: FilePath -> [FilePath] -> Inline -> Inline
-adjustImagePath dir paths (Image lab (src, tit))
-   | src `elem` paths = Image lab (dir ++ "/" ++ src, tit)
+adjustImagePath dir paths (Image attr lab (src, tit))
+   | src `elem` paths = Image attr lab (dir ++ "/" ++ src, tit)
 adjustImagePath _ _ x = x
 
 adjustMetadata :: M.Map String MetaValue -> Pandoc -> IO Pandoc
@@ -1019,35 +1107,50 @@ adjustMetadata metadata d = return $ M.foldWithKey setMeta d metadata
 applyTransforms :: [Transform] -> Pandoc -> IO Pandoc
 applyTransforms transforms d = return $ foldr ($) d transforms
 
-applyFilters :: [FilePath] -> [String] -> Pandoc -> IO Pandoc
-applyFilters filters args d =
-  foldrM ($) d $ map (flip externalFilter args) filters
+  -- First we check to see if a filter is found.  If not, and if it's
+  -- not an absolute path, we check to see whether it's in `userdir/filters`.
+  -- If not, we leave it unchanged.
+expandFilterPath :: Maybe FilePath -> FilePath -> IO FilePath
+expandFilterPath mbDatadir fp = do
+  fpExists <- doesFileExist fp
+  if fpExists
+     then return fp
+     else case mbDatadir of
+               Just datadir | isRelative fp -> do
+                 let filterPath = (datadir </> "filters" </> fp)
+                 filterPathExists <- doesFileExist filterPath
+                 if filterPathExists
+                    then return filterPath
+                    else return fp
+               _ -> return fp
+
+applyFilters :: Maybe FilePath -> [FilePath] -> [String] -> Pandoc -> IO Pandoc
+applyFilters mbDatadir filters args d = do
+  expandedFilters <- mapM (expandFilterPath mbDatadir) filters
+  foldrM ($) d $ map (flip externalFilter args) expandedFilters
+
+uppercaseFirstLetter :: String -> String
+uppercaseFirstLetter (c:cs) = toUpper c : cs
+uppercaseFirstLetter [] = []
 
 main :: IO ()
 main = do
 
   rawArgs <- map UTF8.decodeArg <$> getArgs
   prg <- getProgName
-  let compatMode = (prg == "hsmarkdown")
 
-  let (actions, args, errors) = if compatMode
-                                  then ([], rawArgs, [])
-                                  else getOpt Permute options rawArgs
+  let (actions, args, errors) = getOpt Permute options rawArgs
 
   unless (null errors) $
      err 2 $ concat $ errors ++
         ["Try " ++ prg ++ " --help for more information."]
 
-  let defaultOpts' = if compatMode
-                       then defaultOpts { optReader = "markdown_strict"
-                                        , optWriter = "html"
-                                        , optEmailObfuscation =
-                                           ReferenceObfuscation }
-                       else defaultOpts
-
   -- thread option data structure through all supplied option actions
-  opts <- foldl (>>=) (return defaultOpts') actions
+  opts <- foldl (>>=) (return defaultOpts) actions
+  convertWithOpts opts args
 
+convertWithOpts :: Opt -> [FilePath] -> IO ()
+convertWithOpts opts args = do
   let Opt    {  optTabStop               = tabStop
               , optPreserveTabs          = preserveTabs
               , optStandalone            = standalone
@@ -1071,7 +1174,7 @@ main = do
               , optHtmlQTags             = htmlQTags
               , optHighlight             = highlight
               , optHighlightStyle        = highlightStyle
-              , optChapters              = chapters
+              , optTopLevelDivision      = topLevelDivision
               , optHTMLMathMethod        = mathMethod'
               , optReferenceODT          = referenceODT
               , optReferenceDocx         = referenceDocx
@@ -1084,6 +1187,8 @@ main = do
               , optIgnoreArgs            = ignoreArgs
               , optVerbose               = verbose
               , optReferenceLinks        = referenceLinks
+              , optReferenceLocation     = referenceLocation
+              , optDpi                   = dpi
               , optWrapText              = wrap
               , optColumns               = columns
               , optFilters               = filters
@@ -1103,16 +1208,17 @@ main = do
               , optExtractMedia          = mbExtractMedia
               , optTrace                 = trace
               , optTrackChanges          = trackChanges
+              , optFileScope            = fileScope
               , optKaTeXStylesheet       = katexStylesheet
               , optKaTeXJS               = katexJS
              } = opts
 
   when dumpArgs $
     do UTF8.hPutStrLn stdout outputFile
-       mapM_ (\arg -> UTF8.hPutStrLn stdout arg) args
-       exitWith ExitSuccess
+       mapM_ (UTF8.hPutStrLn stdout) args
+       exitSuccess
 
-  let csscdn = "http://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.1.0/katex.min.css"
+  let csscdn = "https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.6.0/katex.min.css"
   let mathMethod =
         case (katexJS, katexStylesheet) of
             (Nothing, _) -> mathMethod'
@@ -1120,7 +1226,7 @@ main = do
 
 
   -- --bibliography implies -F pandoc-citeproc for backwards compatibility:
-  let needsCiteproc = isJust (M.lookup "bibliography" metadata) &&
+  let needsCiteproc = isJust (M.lookup "bibliography" (optMetadata opts)) &&
                       optCiteMethod opts `notElem` [Natbib, Biblatex] &&
                       "pandoc-citeproc" `notElem` map takeBaseName filters
   let filters' = if needsCiteproc then "pandoc-citeproc" : filters
@@ -1149,18 +1255,24 @@ main = do
                           "epub2"   -> "epub"
                           "html4"   -> "html"
                           x         -> x
+  let format = takeWhile (`notElem` ['+','-'])
+                       $ takeFileName writerName'  -- in case path to lua script
 
   let pdfOutput = map toLower (takeExtension outputFile) == ".pdf"
 
-  let laTeXOutput = "latex" `isPrefixOf` writerName' ||
-                    "beamer" `isPrefixOf` writerName'
+  let laTeXOutput = format `elem` ["latex", "beamer"]
+  let conTeXtOutput = format == "context"
+  let html5Output = format == "html5"
 
-  writer <- if ".lua" `isSuffixOf` writerName'
+  let laTeXInput = "latex" `isPrefixOf` readerName' ||
+                    "beamer" `isPrefixOf` readerName'
+
+  writer <- if ".lua" `isSuffixOf` format
                -- note:  use non-lowercased version writerName
                then return $ IOStringWriter $ writeCustom writerName
                else case getWriter writerName' of
                          Left e  -> err 9 $
-                           if writerName' == "pdf"
+                           if format == "pdf"
                               then e ++
                                "\nTo create a pdf with pandoc, use " ++
                                "the latex or beamer writer and specify\n" ++
@@ -1172,35 +1284,32 @@ main = do
   reader <- if "t2t" == readerName'
               then (mkStringReader .
                     readTxt2Tags) <$>
-                      (getT2TMeta sources outputFile)
+                      getT2TMeta sources outputFile
               else case getReader readerName' of
                 Right r  -> return r
                 Left e   -> err 7 e'
                   where e' = case readerName' of
-                                  "odt" -> e ++
-                                    "\nPandoc can convert to ODT, but not from ODT.\nTry using LibreOffice to export as HTML, and convert that with pandoc."
                                   "pdf" -> e ++
                                      "\nPandoc can convert to PDF, but not from PDF."
                                   "doc" -> e ++
                                      "\nPandoc can convert from DOCX, but not from DOC.\nTry using Word to save your DOC file as DOCX, and convert that with pandoc."
                                   _ -> e
 
-  let standalone' = standalone || not (isTextFormat writerName') || pdfOutput
+  let standalone' = standalone || not (isTextFormat format) || pdfOutput
 
   templ <- case templatePath of
-                _ | not standalone' -> return ""
+                _ | not standalone' -> return Nothing
                 Nothing -> do
-                           deftemp <- getDefaultTemplate datadir writerName'
+                           deftemp <- getDefaultTemplate datadir format
                            case deftemp of
                                  Left e   -> throwIO e
-                                 Right t  -> return t
+                                 Right t  -> return (Just t)
                 Just tp -> do
                            -- strip off extensions
-                           let format = takeWhile (`notElem` "+-") writerName'
                            let tp' = case takeExtension tp of
                                           ""   -> tp <.> format
                                           _    -> tp
-                           E.catch (UTF8.readFile tp')
+                           Just <$> E.catch (UTF8.readFile tp')
                              (\e -> if isDoesNotExistError e
                                        then E.catch
                                              (readDataFileUTF8 datadir
@@ -1213,12 +1322,9 @@ main = do
                       LaTeXMathML Nothing -> do
                          s <- readDataFileUTF8 datadir "LaTeXMathML.js"
                          return $ ("mathml-script", s) : variables
-                      MathML Nothing -> do
-                         s <- readDataFileUTF8 datadir "MathMLinHTML.js"
-                         return $ ("mathml-script", s) : variables
                       _ -> return variables
 
-  variables'' <- if "dzslides" `isPrefixOf` writerName'
+  variables'' <- if format == "dzslides"
                     then do
                         dztempl <- readDataFileUTF8 datadir
                                      ("dzslides" </> "template.html")
@@ -1238,8 +1344,10 @@ main = do
                                                      uriFragment = "" }
                                 _ -> Nothing
 
-  let readerOpts = def{ readerSmart = smart || (texLigatures &&
-                          (laTeXOutput || "context" `isPrefixOf` writerName'))
+  let readerOpts = def{ readerSmart = if laTeXInput
+                                         then texLigatures
+                                         else smart || (texLigatures &&
+                                               (laTeXOutput || conTeXtOutput))
                       , readerStandalone = standalone'
                       , readerParseRaw = parseRaw
                       , readerColumns = columns
@@ -1250,10 +1358,16 @@ main = do
                       , readerDefaultImageExtension = defaultImageExtension
                       , readerTrace = trace
                       , readerTrackChanges = trackChanges
+                      , readerFileScope   = fileScope
                       }
 
-  when (not (isTextFormat writerName') && outputFile == "-") $
-    err 5 $ "Cannot write " ++ writerName' ++ " output to stdout.\n" ++
+#ifdef _WINDOWS
+  let istty = True
+#else
+  istty <- queryTerminal stdOutput
+#endif
+  when (istty && not (isTextFormat format) && outputFile == "-") $
+    err 5 $ "Cannot write " ++ format ++ " output to stdout.\n" ++
             "Specify an output file using the -o option."
 
   let readSources [] = mapM readSource ["-"]
@@ -1262,6 +1376,8 @@ main = do
       readSource src = case parseURI src of
                             Just u | uriScheme u `elem` ["http:","https:"] ->
                                        readURI src
+                                   | uriScheme u == "file:" ->
+                                       UTF8.readFile (uriPath u)
                             _       -> UTF8.readFile src
       readURI src = do
         res <- openURL src
@@ -1271,7 +1387,7 @@ main = do
 
   let readFiles [] = error "Cannot read archive from stdin"
       readFiles [x] = B.readFile x
-      readFiles (x:xs) = mapM (warn . ("Ignoring: " ++)) xs >> B.readFile x
+      readFiles (x:xs) = mapM_ (warn . ("Ignoring: " ++)) xs >> B.readFile x
 
   let convertTabs = tabFilter (if preserveTabs || readerName' == "t2t"
                                  then 0
@@ -1282,16 +1398,28 @@ main = do
                                then handleIncludes
                                else return . Right
 
-  (doc, media) <- fmap handleError $
-      case reader of
+  let sourceToDoc :: [FilePath] -> IO (Pandoc, MediaBag)
+      sourceToDoc sources' = fmap handleError $
+        case reader of
           StringReader r-> do
-            srcs <- convertTabs . intercalate "\n" <$> readSources sources
+            srcs <- convertTabs . intercalate "\n" <$> readSources sources'
             doc <- handleIncludes' srcs
             either (return . Left) (\s -> fmap (,mempty) <$> r readerOpts s) doc
-          ByteStringReader r -> readFiles sources >>= r readerOpts
+          ByteStringReader r -> readFiles sources' >>= r readerOpts
 
-  let writerOptions = def { writerStandalone       = standalone',
-                            writerTemplate         = templ,
+  -- We parse first if (1) fileScope is set, (2), it's a binary
+  -- reader, or (3) we're reading JSON. This is easier to do of an AND
+  -- of negatives as opposed to an OR of positives, so we do default
+  -- parsing if it's a StringReader AND (fileScope is set AND it's not
+  -- a JSON reader).
+  (doc, media) <- case reader of
+    (StringReader _) | not fileScope && readerName' /= "json" ->
+                         sourceToDoc sources
+    _ | null sources -> sourceToDoc sources
+    _  -> do pairs <- mapM (\s -> sourceToDoc [s]) sources
+             return (mconcat $ map fst pairs, mconcat $ map snd pairs)
+
+  let writerOptions = def { writerTemplate         = templ,
                             writerVariables        = variables'',
                             writerTabStop          = tabStop,
                             writerTableOfContents  = toc,
@@ -1303,6 +1431,8 @@ main = do
                             writerNumberOffset     = numberFrom,
                             writerSectionDivs      = sectionDivs,
                             writerReferenceLinks   = referenceLinks,
+                            writerReferenceLocation = referenceLocation,
+                            writerDpi              = dpi,
                             writerWrapText         = wrap,
                             writerColumns          = columns,
                             writerEmailObfuscation = obfuscationMethod,
@@ -1311,7 +1441,7 @@ main = do
                             writerUserDataDir      = datadir,
                             writerHtml5            = html5,
                             writerHtmlQTags        = htmlQTags,
-                            writerChapters         = chapters,
+                            writerTopLevelDivision = topLevelDivision,
                             writerListings         = listings,
                             writerBeamer           = False,
                             writerSlideLevel       = slideLevel,
@@ -1335,10 +1465,11 @@ main = do
   doc' <- (maybe return (extractMedia media) mbExtractMedia >=>
            adjustMetadata metadata >=>
            applyTransforms transforms >=>
-           applyFilters filters' [writerName']) doc
+           applyFilters datadir filters' [format]) doc
 
-  let writeBinary :: B.ByteString -> IO ()
-      writeBinary = B.writeFile (UTF8.encodePath outputFile)
+  let writeFnBinary :: FilePath -> B.ByteString -> IO ()
+      writeFnBinary "-" = B.putStr
+      writeFnBinary f   = B.writeFile (UTF8.encodePath f)
 
   let writerFn :: FilePath -> String -> IO ()
       writerFn "-" = UTF8.putStr
@@ -1346,33 +1477,36 @@ main = do
 
   case writer of
     IOStringWriter f -> f writerOptions doc' >>= writerFn outputFile
-    IOByteStringWriter f -> f writerOptions doc' >>= writeBinary
+    IOByteStringWriter f -> f writerOptions doc' >>= writeFnBinary outputFile
     PureStringWriter f
       | pdfOutput -> do
-              -- make sure writer is latex or beamer
-              unless laTeXOutput $
-                err 47 $ "cannot produce pdf output with " ++ writerName' ++
+              -- make sure writer is latex or beamer or context or html5
+              unless (laTeXOutput || conTeXtOutput || html5Output) $
+                err 47 $ "cannot produce pdf output with " ++ format ++
                          " writer"
 
-              -- check for latex program
-              mbLatex <- findExecutable latexEngine
-              when (mbLatex == Nothing) $
-                   err 41 $ latexEngine ++ " not found. " ++
-                     latexEngine ++ " is needed for pdf output."
+              let pdfprog = case () of
+                              _ | conTeXtOutput -> "context"
+                              _ | html5Output   -> "wkhtmltopdf"
+                              _                 -> latexEngine
+              -- check for pdf creating program
+              mbPdfProg <- findExecutable pdfprog
+              when (isNothing mbPdfProg) $
+                   err 41 $ pdfprog ++ " not found. " ++
+                     pdfprog ++ " is needed for pdf output."
 
-              res <- makePDF latexEngine f writerOptions doc'
+              res <- makePDF pdfprog f writerOptions doc'
               case res of
-                   Right pdf -> writeBinary pdf
+                   Right pdf -> writeFnBinary outputFile pdf
                    Left err' -> do
-                     B.hPutStr stderr $ err'
+                     B.hPutStr stderr err'
                      B.hPut stderr $ B.pack [10]
-                     err 43 "Error producing PDF from TeX source"
+                     err 43 "Error producing PDF"
       | otherwise -> selfcontain (f writerOptions doc' ++
                                   ['\n' | not standalone'])
                       >>= writerFn outputFile . handleEntities
-          where htmlFormat = writerName' `elem`
-                               ["html","html+lhs","html5","html5+lhs",
-                               "s5","slidy","slideous","dzslides","revealjs"]
+          where htmlFormat = format `elem`
+                  ["html","html5","s5","slidy","slideous","dzslides","revealjs"]
                 selfcontain = if selfContained && htmlFormat
                                  then makeSelfContained writerOptions
                                  else return

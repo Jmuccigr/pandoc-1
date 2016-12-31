@@ -35,6 +35,7 @@ import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.Shared
 import Text.Pandoc.Writers.Shared
+import Text.Pandoc.ImageSize
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Builder (deleteMeta)
 import Data.Maybe (fromMaybe)
@@ -42,7 +43,6 @@ import Data.List ( isPrefixOf, stripPrefix, intersperse, transpose )
 import Network.URI (isURI)
 import Text.Pandoc.Pretty
 import Control.Monad.State
-import Control.Applicative ( (<$>) )
 import Data.Char (isSpace, toLower)
 
 type Refs = [([Inline], Target)]
@@ -50,7 +50,7 @@ type Refs = [([Inline], Target)]
 data WriterState =
   WriterState { stNotes       :: [[Block]]
               , stLinks       :: Refs
-              , stImages      :: [([Inline], (String, String, Maybe String))]
+              , stImages      :: [([Inline], (Attr, String, String, Maybe String))]
               , stHasMath     :: Bool
               , stHasRawTeX   :: Bool
               , stOptions     :: WriterOptions
@@ -70,7 +70,7 @@ writeRST opts document =
 pandocToRST :: Pandoc -> State WriterState String
 pandocToRST (Pandoc meta blocks) = do
   opts <- liftM stOptions get
-  let colwidth = if writerWrapText opts
+  let colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
   let subtit = case lookupMeta "subtitle" meta of
@@ -81,7 +81,9 @@ pandocToRST (Pandoc meta blocks) = do
                 (fmap (render colwidth) . blockListToRST)
                 (fmap (trimr . render colwidth) . inlineListToRST)
                 $ deleteMeta "title" $ deleteMeta "subtitle" meta
-  body <- blockListToRST' True $ normalizeHeadings 1 blocks
+  body <- blockListToRST' True $ case writerTemplate opts of
+                                      Just _  -> normalizeHeadings 1 blocks
+                                      Nothing -> blocks
   notes <- liftM (reverse . stNotes) get >>= notesToRST
   -- note that the notes may contain refs, so we do them first
   refs <- liftM (reverse . stLinks) get >>= refsToRST
@@ -97,11 +99,12 @@ pandocToRST (Pandoc meta blocks) = do
               $ defField "math" hasMath
               $ defField "rawtex" rawTeX
               $ metadata
-  if writerStandalone opts
-     then return $ renderTemplate' (writerTemplate opts) context
-     else return main
+  case writerTemplate opts of
+       Nothing  -> return main
+       Just tpl -> return $ renderTemplate' tpl context
   where
-    normalizeHeadings lev (Header l a i:bs) = Header lev a i:normalizeHeadings (lev+1) cont ++ normalizeHeadings lev bs'
+    normalizeHeadings lev (Header l a i:bs) =
+      Header lev a i:normalizeHeadings (lev+1) cont ++ normalizeHeadings lev bs'
       where (cont,bs') = break (headerLtEq l) bs
             headerLtEq level (Header l' _ _) = l' <= level
             headerLtEq _ _ = False
@@ -136,17 +139,22 @@ noteToRST num note = do
   return $ nowrap $ marker $$ nest 3 contents
 
 -- | Return RST representation of picture reference table.
-pictRefsToRST :: [([Inline], (String, String, Maybe String))]
+pictRefsToRST :: [([Inline], (Attr, String, String, Maybe String))]
               -> State WriterState Doc
 pictRefsToRST refs = mapM pictToRST refs >>= return . vcat
 
 -- | Return RST representation of a picture substitution reference.
-pictToRST :: ([Inline], (String, String,Maybe String))
+pictToRST :: ([Inline], (Attr, String, String, Maybe String))
           -> State WriterState Doc
-pictToRST (label, (src, _, mbtarget)) = do
+pictToRST (label, (attr, src, _, mbtarget)) = do
   label' <- inlineListToRST label
+  dims   <- imageDimsToRST attr
+  let (_, cls, _) = attr
+      classes = if null cls
+                   then empty
+                   else ":class: " <> text (unwords cls)
   return $ nowrap
-         $ ".. |" <> label' <> "| image:: " <> text src
+         $ ".. |" <> label' <> "| image:: " <> text src $$ hang 3 empty (classes $$ dims)
          $$ case mbtarget of
                  Nothing -> empty
                  Just t  -> "   :target: " <> text t
@@ -181,18 +189,24 @@ blockToRST (Div attr bs) = do
   return $ blankline <> startTag $+$ contents $+$ endTag $$ blankline
 blockToRST (Plain inlines) = inlineListToRST inlines
 -- title beginning with fig: indicates that the image is a figure
-blockToRST (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
+blockToRST (Para [Image attr txt (src,'f':'i':'g':':':tit)]) = do
   capt <- inlineListToRST txt
+  dims <- imageDimsToRST attr
   let fig = "figure:: " <> text src
-  let alt = ":alt: " <> if null tit then capt else text tit
-  return $ hang 3 ".. " (fig $$ alt $+$ capt) $$ blankline
+      alt = ":alt: " <> if null tit then capt else text tit
+      (_,cls,_) = attr
+      classes = if null cls
+                   then empty
+                   else ":figclass: " <> text (unwords cls)
+  return $ hang 3 ".. " (fig $$ alt $$ classes $$ dims $+$ capt) $$ blankline
 blockToRST (Para inlines)
   | LineBreak `elem` inlines = do -- use line block if LineBreaks
-      lns <- mapM inlineListToRST $ splitBy (==LineBreak) inlines
-      return $ (vcat $ map (hang 2 (text "| ")) lns) <> blankline
+      linesToLineBlock $ splitBy (==LineBreak) inlines
   | otherwise = do
       contents <- inlineListToRST inlines
       return $ contents <> blankline
+blockToRST (LineBlock lns) =
+  linesToLineBlock lns
 blockToRST (RawBlock f@(Format f') str)
   | f == "rst" = return $ text str
   | otherwise  = return $ blankline <> ".. raw:: " <>
@@ -254,7 +268,7 @@ blockToRST (Table caption _ widths headers rows) =  do
           then map ((+2) . numChars) $ transpose (headers' : rawRows)
           else map (floor . (fromIntegral (writerColumns opts) *)) widths
   let hpipeBlocks blocks = hcat [beg, middle, end]
-        where h      = maximum (map height blocks)
+        where h      = height (hcat blocks)
               sep'   = lblock 3 $ vcat (map text $ replicate h " | ")
               beg    = lblock 2 $ vcat (map text $ replicate h "| ")
               end    = lblock 2 $ vcat (map text $ replicate h " |")
@@ -315,6 +329,12 @@ definitionListItemToRST (label, defs) = do
   tabstop <- get >>= (return . writerTabStop . stOptions)
   return $ label' $$ nest tabstop (nestle contents <> cr)
 
+-- | Format a list of lines as line block.
+linesToLineBlock :: [[Inline]] -> State WriterState Doc
+linesToLineBlock inlineLines = do
+  lns <- mapM inlineListToRST inlineLines
+  return $ (vcat $ map (hang 2 (text "| ")) lns) <> blankline
+
 -- | Convert list of Pandoc block elements to RST.
 blockListToRST' :: Bool
                 -> [Block]       -- ^ List of block elements
@@ -333,7 +353,8 @@ blockListToRST = blockListToRST' False
 -- | Convert list of Pandoc inline elements to RST.
 inlineListToRST :: [Inline] -> State WriterState Doc
 inlineListToRST lst =
-  mapM inlineToRST (removeSpaceAfterDisplayMath $ insertBS lst) >>= return . hcat
+  mapM inlineToRST (removeSpaceAfterDisplayMath $ insertBS lst) >>=
+    return . hcat
   where -- remove spaces after displaymath, as they screw up indentation:
         removeSpaceAfterDisplayMath (Math DisplayMath x : zs) =
               Math DisplayMath x : dropWhile (==Space) zs
@@ -341,8 +362,8 @@ inlineListToRST lst =
         removeSpaceAfterDisplayMath [] = []
         insertBS :: [Inline] -> [Inline] -- insert '\ ' where needed
         insertBS (x:y:z:zs)
-          | isComplex y && surroundComplex x z =
-             x : y : RawInline "rst" "\\ " : insertBS (z:zs)
+          | isComplex y && (surroundComplex x z) =
+              x : y : insertBS (z : zs)
         insertBS (x:y:zs)
           | isComplex x && not (okAfterComplex y) =
               x : RawInline "rst" "\\ " : insertBS (y : zs)
@@ -364,11 +385,13 @@ inlineListToRST lst =
         surroundComplex _ _ = False
         okAfterComplex :: Inline -> Bool
         okAfterComplex Space = True
+        okAfterComplex SoftBreak = True
         okAfterComplex LineBreak = True
         okAfterComplex (Str (c:_)) = isSpace c || c `elem` ("-.,:;!?\\/'\")]}>–—" :: String)
         okAfterComplex _ = False
         okBeforeComplex :: Inline -> Bool
         okBeforeComplex Space = True
+        okBeforeComplex SoftBreak = True
         okBeforeComplex LineBreak = True
         okBeforeComplex (Str (c:_)) = isSpace c || c `elem` ("-:/'\"<([{–—" :: String)
         okBeforeComplex _ = False
@@ -379,10 +402,12 @@ inlineListToRST lst =
         isComplex (Strikeout _) = True
         isComplex (Superscript _) = True
         isComplex (Subscript _) = True
-        isComplex (Link _ _) = True
-        isComplex (Image _ _) = True
+        isComplex (Link _ _ _) = True
+        isComplex (Image _ _ _) = True
         isComplex (Code _ _) = True
         isComplex (Math _ _) = True
+        isComplex (Cite _ (x:_)) = isComplex x
+        isComplex (Span _ (x:_)) = isComplex x
         isComplex _ = False
 
 -- | Convert Pandoc inline element to RST.
@@ -430,18 +455,24 @@ inlineToRST (RawInline f x)
   | otherwise  = return empty
 inlineToRST (LineBreak) = return cr -- there's no line break in RST (see Para)
 inlineToRST Space = return space
+inlineToRST SoftBreak = do
+  wrapText <- gets (writerWrapText . stOptions)
+  case wrapText of
+        WrapPreserve  -> return cr
+        WrapAuto      -> return space
+        WrapNone      -> return space
 -- autolink
-inlineToRST (Link [Str str] (src, _))
+inlineToRST (Link _ [Str str] (src, _))
   | isURI src &&
     if "mailto:" `isPrefixOf` src
        then src == escapeURI ("mailto:" ++ str)
        else src == escapeURI str = do
   let srcSuffix = fromMaybe src (stripPrefix "mailto:" src)
   return $ text srcSuffix
-inlineToRST (Link [Image alt (imgsrc,imgtit)] (src, _tit)) = do
-  label <- registerImage alt (imgsrc,imgtit) (Just src)
+inlineToRST (Link _ [Image attr alt (imgsrc,imgtit)] (src, _tit)) = do
+  label <- registerImage attr alt (imgsrc,imgtit) (Just src)
   return $ "|" <> label <> "|"
-inlineToRST (Link txt (src, tit)) = do
+inlineToRST (Link _ txt (src, tit)) = do
   useReferenceLinks <- get >>= return . writerReferenceLinks . stOptions
   linktext <- inlineListToRST $ normalizeSpaces txt
   if useReferenceLinks
@@ -456,8 +487,8 @@ inlineToRST (Link txt (src, tit)) = do
                    modify $ \st -> st { stLinks = (txt,(src,tit)):refs }
                    return $ "`" <> linktext <> "`_"
     else return $ "`" <> linktext <> " <" <> text src <> ">`__"
-inlineToRST (Image alternate (source, tit)) = do
-  label <- registerImage alternate (source,tit) Nothing
+inlineToRST (Image attr alternate (source, tit)) = do
+  label <- registerImage attr alternate (source,tit) Nothing
   return $ "|" <> label <> "|"
 inlineToRST (Note contents) = do
   -- add to notes in state
@@ -466,16 +497,33 @@ inlineToRST (Note contents) = do
   let ref = show $ (length notes) + 1
   return $ " [" <> text ref <> "]_"
 
-registerImage :: [Inline] -> Target -> Maybe String -> State WriterState Doc
-registerImage alt (src,tit) mbtarget = do
+registerImage :: Attr -> [Inline] -> Target -> Maybe String -> State WriterState Doc
+registerImage attr alt (src,tit) mbtarget = do
   pics <- get >>= return . stImages
   txt <- case lookup alt pics of
-               Just (s,t,mbt) | (s,t,mbt) == (src,tit,mbtarget) -> return alt
+               Just (a,s,t,mbt) | (a,s,t,mbt) == (attr,src,tit,mbtarget)
+                 -> return alt
                _ -> do
                  let alt' = if null alt || alt == [Str ""]
                                then [Str $ "image" ++ show (length pics)]
                                else alt
                  modify $ \st -> st { stImages =
-                        (alt', (src,tit, mbtarget)):stImages st }
+                        (alt', (attr,src,tit, mbtarget)):stImages st }
                  return alt'
   inlineListToRST txt
+
+imageDimsToRST :: Attr -> State WriterState Doc
+imageDimsToRST attr = do
+  let (ident, _, _) = attr
+      name = if null ident
+                then empty
+                else ":name: " <> text ident
+      showDim dir = let cols d = ":" <> text (show dir) <> ": " <> text (show d)
+                    in  case (dimension dir attr) of
+                          Just (Percent a) ->
+                            case dir of
+                              Height -> empty
+                              Width  -> cols (Percent a)
+                          Just dim -> cols dim
+                          Nothing  -> empty
+  return $ cr <> name $$ showDim Width $$ showDim Height

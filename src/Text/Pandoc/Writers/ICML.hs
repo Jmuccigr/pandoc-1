@@ -2,7 +2,7 @@
 
 {- |
    Module      : Text.Pandoc.Writers.ICML
-   Copyright   : Copyright (C) 2013 github.com/mb21
+   Copyright   : Copyright (C) 2013-2016 github.com/mb21
    License     : GNU GPL, version 2 or above
 
    Stability   : alpha
@@ -16,15 +16,17 @@ into InDesign with File -> Place.
 module Text.Pandoc.Writers.ICML (writeICML) where
 import Text.Pandoc.Definition
 import Text.Pandoc.XML
+import Text.Pandoc.Readers.TeXMath (texMathToInlines)
 import Text.Pandoc.Writers.Shared
-import Text.Pandoc.Shared (splitBy)
+import Text.Pandoc.Shared (linesToPara, splitBy, fetchItem, warn)
 import Text.Pandoc.Options
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Pretty
-import Data.List (isPrefixOf, isInfixOf, stripPrefix)
+import Text.Pandoc.ImageSize
+import Data.List (isPrefixOf, isInfixOf, stripPrefix, intersperse)
 import Data.Text as Text (breakOnAll, pack)
-import Data.Monoid (mappend)
 import Control.Monad.State
+import Network.URI (isURI)
 import qualified Data.Set as Set
 
 type Style = [String]
@@ -38,7 +40,7 @@ data WriterState = WriterState{
   , maxListDepth :: Int
   }
 
-type WS a = State WriterState a
+type WS a = StateT WriterState IO a
 
 defaultWriterState :: WriterState
 defaultWriterState = WriterState{
@@ -69,6 +71,8 @@ linkName        = "Link"
 
 -- block element names (appear in InDesign's paragraph styles pane)
 paragraphName     :: String
+figureName        :: String
+imgCaptionName    :: String
 codeBlockName     :: String
 blockQuoteName    :: String
 orderedListName   :: String
@@ -90,7 +94,10 @@ lowerAlphaName    :: String
 upperAlphaName    :: String
 subListParName    :: String
 footnoteName      :: String
+citeName          :: String
 paragraphName     = "Paragraph"
+figureName        = "Figure"
+imgCaptionName    = "Caption"
 codeBlockName     = "CodeBlock"
 blockQuoteName    = "Blockquote"
 orderedListName   = "NumList"
@@ -112,30 +119,31 @@ lowerAlphaName    = "lowerAlpha"
 upperAlphaName    = "upperAlpha"
 subListParName    = "subParagraph"
 footnoteName      = "Footnote"
+citeName          = "Cite"
 
 
 -- | Convert Pandoc document to string in ICML format.
-writeICML :: WriterOptions -> Pandoc -> String
-writeICML opts (Pandoc meta blocks) =
-  let colwidth = if writerWrapText opts
+writeICML :: WriterOptions -> Pandoc -> IO String
+writeICML opts (Pandoc meta blocks) = do
+  let colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
       render' = render colwidth
-      renderMeta f s = Just $ render' $ fst $ runState (f opts [] s) defaultWriterState
-      Just metadata = metaToJSON opts
-                 (renderMeta blocksToICML)
-                 (renderMeta inlinesToICML)
-                 meta
-      (doc, st) = runState (blocksToICML opts [] blocks) defaultWriterState
-      main    = render' doc
+      renderMeta f s = liftM (render' . fst) $ runStateT (f opts [] s) defaultWriterState
+  metadata <- metaToJSON opts
+             (renderMeta blocksToICML)
+             (renderMeta inlinesToICML)
+             meta
+  (doc, st) <- runStateT (blocksToICML opts [] blocks) defaultWriterState
+  let main    = render' doc
       context = defField "body" main
               $ defField "charStyles" (render' $ charStylesToDoc st)
               $ defField "parStyles"  (render' $ parStylesToDoc st)
               $ defField "hyperlinks" (render' $ hyperlinksToDoc $ links st)
               $ metadata
-  in  if writerStandalone opts
-         then renderTemplate' (writerTemplate opts) context
-         else main
+  return $ case writerTemplate opts of
+                Nothing  -> main
+                Just tpl -> renderTemplate' tpl context
 
 -- | Auxilary functions for parStylesToDoc and charStylesToDoc.
 contains :: String -> (String, (String, String)) -> [(String, String)]
@@ -250,6 +258,13 @@ charStylesToDoc st = vcat $ map makeStyle $ Set.toAscList $ inlineStyles st
                          else empty
       in  inTags True "CharacterStyle" ([("Self", "CharacterStyle/"++s), ("Name", s)] ++ attrs') props
 
+-- | Escape colon characters as %3a
+escapeColons :: String -> String
+escapeColons (x:xs)
+  | x == ':' = "%3a" ++ escapeColons xs
+  | otherwise = x : escapeColons xs
+escapeColons []     = []
+
 -- | Convert a list of (identifier, url) pairs to the ICML listing of hyperlinks.
 hyperlinksToDoc :: Hyperlink -> Doc
 hyperlinksToDoc []     = empty
@@ -258,23 +273,32 @@ hyperlinksToDoc (x:xs) = hyp x $$ hyperlinksToDoc xs
     hyp (ident, url) = hdest $$ hlink
       where
         hdest = selfClosingTag "HyperlinkURLDestination"
-                  [("Self", "HyperlinkURLDestination/"++url), ("Name","link"), ("DestinationURL",url), ("DestinationUniqueKey","1")]
+                  [("Self", "HyperlinkURLDestination/"++(escapeColons url)), ("Name","link"), ("DestinationURL",url), ("DestinationUniqueKey","1")] -- HyperlinkURLDestination with more than one colon crashes CS6
         hlink = inTags True "Hyperlink" [("Self","uf-"++show ident),  ("Name",url),
                     ("Source","htss-"++show ident), ("Visible","true"), ("DestinationUniqueKey","1")]
                   $ inTags True "Properties" []
                   $ inTags False "BorderColor" [("type","enumeration")] (text "Black")
                   $$ (inTags False "Destination" [("type","object")]
-                  $ text $ "HyperlinkURLDestination/"++(escapeStringForXML url))
+                  $ text $ "HyperlinkURLDestination/"++(escapeColons (escapeStringForXML url))) -- HyperlinkURLDestination with more than one colon crashes CS6
 
 
 -- | Convert a list of Pandoc blocks to ICML.
 blocksToICML :: WriterOptions -> Style -> [Block] -> WS Doc
-blocksToICML opts style lst = vcat `fmap` mapM (blockToICML opts style) lst
+blocksToICML opts style lst = do
+  docs <- mapM (blockToICML opts style) lst
+  return $ intersperseBrs docs
 
 -- | Convert a Pandoc block element to ICML.
 blockToICML :: WriterOptions -> Style -> Block -> WS Doc
 blockToICML opts style (Plain lst) = parStyle opts style lst
+-- title beginning with fig: indicates that the image is a figure
+blockToICML opts style (Para img@[Image _ txt (_,'f':'i':'g':':':_)]) = do
+  figure  <- parStyle opts (figureName:style) img
+  caption <- parStyle opts (imgCaptionName:style) txt
+  return $ intersperseBrs [figure, caption]
 blockToICML opts style (Para lst) = parStyle opts (paragraphName:style) lst
+blockToICML opts style (LineBlock lns) =
+  blockToICML opts style $ linesToPara lns
 blockToICML opts style (CodeBlock _ str) = parStyle opts (codeBlockName:style) $ [Str str]
 blockToICML _ _ (RawBlock f str)
   | f == Format "icml" = return $ text str
@@ -282,7 +306,7 @@ blockToICML _ _ (RawBlock f str)
 blockToICML opts style (BlockQuote blocks) = blocksToICML opts (blockQuoteName:style) blocks
 blockToICML opts style (OrderedList attribs lst) = listItemsToICML opts orderedListName style (Just attribs) lst
 blockToICML opts style (BulletList lst) = listItemsToICML opts bulletListName style Nothing lst
-blockToICML opts style (DefinitionList lst) = vcat `fmap` mapM (definitionListItemToICML opts style) lst
+blockToICML opts style (DefinitionList lst) = intersperseBrs `fmap` mapM (definitionListItemToICML opts style) lst
 blockToICML opts style (Header lvl _ lst) =
   let stl = (headerName ++ show lvl):style
   in parStyle opts stl lst
@@ -299,13 +323,13 @@ blockToICML opts style (Table caption aligns widths headers rows) =
                   else length $ head rows
       rowsToICML [] _ = return empty
       rowsToICML (col:rest) rowNr =
-        liftM2 ($$) (colsToICML col rowNr (0::Int)) $ rowsToICML rest (rowNr+1)
-      colsToICML [] _ _ = return empty
-      colsToICML (cell:rest) rowNr colNr = do
+        liftM2 ($$) (colsToICML col aligns rowNr (0::Int)) $ rowsToICML rest (rowNr+1)
+      colsToICML [] _ _ _ = return empty
+      colsToICML _ [] _ _ = return empty
+      colsToICML (cell:rest) (alig:restAligns) rowNr colNr = do
         let stl  = if rowNr == 0 && not noHeader
                       then tableHeaderName:style'
                       else style'
-            alig = aligns !! colNr
             stl' | alig == AlignLeft = alignLeftName : stl
                  | alig == AlignRight = alignRightName : stl
                  | alig == AlignCenter = alignCenterName : stl
@@ -313,7 +337,7 @@ blockToICML opts style (Table caption aligns widths headers rows) =
         c <- blocksToICML opts stl' cell
         let cl = return $ inTags True "Cell"
                    [("Name", show colNr ++":"++ show rowNr), ("AppliedCellStyle","CellStyle/Cell")] c
-        liftM2 ($$) cl $ colsToICML rest rowNr (colNr+1)
+        liftM2 ($$) cl $ colsToICML rest restAligns rowNr (colNr+1)
   in  do
       let tabl = if noHeader
                     then rows
@@ -347,7 +371,7 @@ listItemsToICML opts listType style attribs (first:rest) = do
   s    <- get
   let maxD = max (maxListDepth s) (listDepth s)
   put s{ listDepth = 1, maxListDepth = maxD }
-  return $ vcat docs
+  return $ intersperseBrs docs
 
 -- | Convert a list of blocks to ICML list items.
 listItemToICML :: WriterOptions -> Style -> Bool-> Maybe ListAttributes -> [Block] -> WS Doc
@@ -373,15 +397,15 @@ listItemToICML opts style isFirst attribs item =
            let insertTab (Para lst) = blockToICML opts (subListParName:style) $ Para $ (Str "\t"):lst
                insertTab block      = blockToICML opts style block
            f <- blockToICML opts stl' $ head item
-           r <- fmap vcat $ mapM insertTab $ tail item
-           return $ f $$ r
+           r <- mapM insertTab $ tail item
+           return $ intersperseBrs (f : r)
          else blocksToICML opts stl' item
 
 definitionListItemToICML :: WriterOptions -> Style -> ([Inline],[[Block]]) -> WS Doc
 definitionListItemToICML opts style (term,defs) = do
   term' <- parStyle opts (defListTermName:style) term
-  defs' <- vcat `fmap` mapM (blocksToICML opts (defListDefName:style)) defs
-  return $ term' $$ defs'
+  defs' <- mapM (blocksToICML opts (defListDefName:style)) defs
+  return $ intersperseBrs $ (term' : defs')
 
 
 -- | Convert a list of inline elements to ICML.
@@ -399,15 +423,21 @@ inlineToICML opts style (Subscript lst) = inlinesToICML opts (subscriptName:styl
 inlineToICML opts style (SmallCaps lst) = inlinesToICML opts (smallCapsName:style) lst
 inlineToICML opts style (Quoted SingleQuote lst) = inlinesToICML opts style $ [Str "‘"] ++ lst ++ [Str "’"]
 inlineToICML opts style (Quoted DoubleQuote lst) = inlinesToICML opts style $ [Str "“"] ++ lst ++ [Str "”"]
-inlineToICML opts style (Cite _ lst) = inlinesToICML opts style lst
+inlineToICML opts style (Cite _ lst) = inlinesToICML opts (citeName:style) lst
 inlineToICML _    style (Code _ str) = charStyle (codeName:style) $ text $ escapeStringForXML str
 inlineToICML _    style Space = charStyle style space
+inlineToICML opts style SoftBreak =
+  case writerWrapText opts of
+       WrapAuto     -> charStyle style space
+       WrapNone     -> charStyle style space
+       WrapPreserve -> charStyle style cr
 inlineToICML _ style LineBreak = charStyle style $ text lineSeparator
-inlineToICML _ style (Math _ str) = charStyle style $ text $ escapeStringForXML str --InDesign doesn't really do math
+inlineToICML opts style (Math mt str) =
+  cat <$> mapM (inlineToICML opts style) (texMathToInlines mt str)
 inlineToICML _ _ (RawInline f str)
   | f == Format "icml" = return $ text str
   | otherwise          = return empty
-inlineToICML opts style (Link lst (url, title)) = do
+inlineToICML opts style (Link _ lst (url, title)) = do
   content <- inlinesToICML opts (linkName:style) lst
   state $ \st ->
             let ident = if null $ links st
@@ -417,7 +447,7 @@ inlineToICML opts style (Link lst (url, title)) = do
                 cont  = inTags True "HyperlinkTextSource"
                          [("Self","htss-"++show ident), ("Name",title), ("Hidden","false")] content
             in  (cont, newst)
-inlineToICML opts style (Image alt target) = imageICML opts style alt target
+inlineToICML opts style (Image attr _ target) = imageICML opts style attr target
 inlineToICML opts style (Note lst) = footnoteToICML opts style lst
 inlineToICML opts style (Span _ lst) = inlinesToICML opts style lst
 
@@ -432,15 +462,25 @@ footnoteToICML opts style lst =
                    inTags True "CharacterStyleRange" [] $ inTagsSimple "Content" "<?ACE 4?>"
     return $ inTags True "CharacterStyleRange"
       [("AppliedCharacterStyle","$ID/NormalCharacterStyle"), ("Position","Superscript")]
-      $ inTags True "Footnote" [] $ number $$ vcat contents
+      $ inTags True "Footnote" [] $ number $$ intersperseBrs contents
 
 -- | Auxiliary function to merge Space elements into the adjacent Strs.
 mergeSpaces :: [Inline] -> [Inline]
-mergeSpaces ((Str s):(Space:((Str s'):xs))) = mergeSpaces $ Str(s++" "++s') : xs
-mergeSpaces (Space:((Str s):xs)) = mergeSpaces $ Str (" "++s) : xs
-mergeSpaces ((Str s):(Space:xs)) = mergeSpaces $ Str (s++" ") : xs
+mergeSpaces ((Str s):(x:((Str s'):xs))) | isSp x =
+  mergeSpaces $ Str(s++" "++s') : xs
+mergeSpaces (x:((Str s):xs)) | isSp x = mergeSpaces $ Str (" "++s) : xs
+mergeSpaces ((Str s):(x:xs)) | isSp x = mergeSpaces $ Str (s++" ") : xs
 mergeSpaces (x:xs) = x : (mergeSpaces xs)
 mergeSpaces []     = []
+
+isSp :: Inline -> Bool
+isSp Space = True
+isSp SoftBreak = True
+isSp _ = False
+
+-- | Intersperse line breaks
+intersperseBrs :: [Doc] -> Doc
+intersperseBrs = vcat . intersperse (selfClosingTag "Br" []) . filter (not . isEmpty)
 
 -- | Wrap a list of inline elements in an ICML Paragraph Style
 parStyle :: WriterOptions -> Style -> [Inline] -> WS Doc
@@ -463,8 +503,7 @@ parStyle opts style lst =
                    else [attrs]
   in  do
       content <- inlinesToICML opts [] lst
-      let cont = inTags True "ParagraphStyleRange" attrs'
-                   $ mappend content $ selfClosingTag "Br" []
+      let cont = inTags True "ParagraphStyleRange" attrs' content
       state $ \st -> (cont, st{ blockStyles = Set.insert stlStr $ blockStyles st })
 
 -- | Wrap a Doc in an ICML Character Style.
@@ -490,38 +529,48 @@ styleToStrAttr style =
   in  (stlStr, attrs)
 
 -- | Assemble an ICML Image.
-imageICML :: WriterOptions -> Style -> [Inline] -> Target -> WS Doc
-imageICML _ style _ (linkURI, _) =
-  let imgWidth  = 300::Int --TODO: set width, height dynamically as in Docx.hs
-      imgHeight = 200::Int
-      scaleFact = show (1::Double) --TODO: set scaling factor so image is scaled exactly to imgWidth x imgHeight
-      hw = show $ imgWidth  `div` 2
-      hh = show $ imgHeight `div` 2
-      qw = show $ imgWidth  `div` 4
-      qh = show $ imgHeight `div` 4
+imageICML :: WriterOptions -> Style -> Attr -> Target -> WS Doc
+imageICML opts style attr (src, _) = do
+  res  <- liftIO $ fetchItem (writerSourceURL opts) src
+  imgS <- case res of
+            Left (_) -> do
+              warn $ "Could not find image `" ++ src ++ "', skipping..."
+              return def
+            Right (img, _) -> do
+              case imageSize img of
+                Right size -> return size
+                Left msg   -> do
+                  warn $ "Could not determine image size in `" ++
+                    src ++ "': " ++ msg
+                  return def
+  let (ow, oh) = sizeInPoints imgS
+      (imgWidth, imgHeight) = desiredSizeInPoints opts attr imgS
+      hw = showFl $ ow / 2
+      hh = showFl $ oh / 2
+      scale = showFl (imgWidth / ow) ++ " 0 0 " ++ showFl (imgHeight / oh)
+      src' = if isURI src then src else "file:" ++ src
       (stlStr, attrs) = styleToStrAttr style
       props  = inTags True "Properties" [] $ inTags True "PathGeometry" []
                  $ inTags True "GeometryPathType" [("PathOpen","false")]
                  $ inTags True "PathPointArray" []
                  $ vcat [
-                     selfClosingTag "PathPointType" [("Anchor", "-"++qw++" -"++qh),
-                       ("LeftDirection", "-"++qw++" -"++qh), ("RightDirection", "-"++qw++" -"++qh)]
-                   , selfClosingTag "PathPointType" [("Anchor", "-"++qw++" "++qh),
-                       ("LeftDirection", "-"++qw++" "++qh), ("RightDirection", "-"++qw++" "++qh)]
-                   , selfClosingTag "PathPointType" [("Anchor", qw++" "++qh),
-                       ("LeftDirection", qw++" "++qh), ("RightDirection", qw++" "++qh)]
-                   , selfClosingTag "PathPointType" [("Anchor", qw++" -"++qh),
-                       ("LeftDirection", qw++" -"++qh), ("RightDirection", qw++" -"++qh)]
+                     selfClosingTag "PathPointType" [("Anchor", "-"++hw++" -"++hh),
+                       ("LeftDirection", "-"++hw++" -"++hh), ("RightDirection", "-"++hw++" -"++hh)]
+                   , selfClosingTag "PathPointType" [("Anchor", "-"++hw++" "++hh),
+                       ("LeftDirection", "-"++hw++" "++hh), ("RightDirection", "-"++hw++" "++hh)]
+                   , selfClosingTag "PathPointType" [("Anchor", hw++" "++hh),
+                       ("LeftDirection", hw++" "++hh), ("RightDirection", hw++" "++hh)]
+                   , selfClosingTag "PathPointType" [("Anchor", hw++" -"++hh),
+                       ("LeftDirection", hw++" -"++hh), ("RightDirection", hw++" -"++hh)]
                    ]
       image  = inTags True "Image"
-                   [("Self","ue6"), ("ItemTransform", scaleFact++" 0 0 "++scaleFact++" -"++qw++" -"++qh)]
+                   [("Self","ue6"), ("ItemTransform", scale++" -"++hw++" -"++hh)]
                  $ vcat [
                      inTags True "Properties" [] $ inTags True "Profile" [("type","string")] $ text "$ID/Embedded"
-                       $$ selfClosingTag "GraphicBounds" [("Left","0"), ("Top","0"), ("Right", hw), ("Bottom", hh)]
-                   , selfClosingTag "Link" [("Self", "ueb"), ("LinkResourceURI", linkURI)]
+                   , selfClosingTag "Link" [("Self", "ueb"), ("LinkResourceURI", src')]
                    ]
       doc    = inTags True "CharacterStyleRange" attrs
-                 $ inTags True "Rectangle" [("Self","uec"), ("ItemTransform", "1 0 0 1 "++qw++" -"++qh)]
+                 $ inTags True "Rectangle" [("Self","uec"), ("StrokeWeight", "0"),
+                     ("ItemTransform", scale++" "++hw++" -"++hh)]
                  $ (props $$ image)
-  in  do
-      state $ \st -> (doc, st{ inlineStyles = Set.insert stlStr $ inlineStyles st } )
+  state $ \st -> (doc, st{ inlineStyles = Set.insert stlStr $ inlineStyles st } )

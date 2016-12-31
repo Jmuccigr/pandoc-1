@@ -1,6 +1,6 @@
 {-# LANGUAGE ScopedTypeVariables, FlexibleInstances #-}
 {-
-Copyright (C) 2006-2015 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2016 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -19,7 +19,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc
-   Copyright   : Copyright (C) 2006-2015 John MacFarlane
+   Copyright   : Copyright (C) 2006-2016 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -37,12 +37,11 @@ inline links:
 
 > module Main where
 > import Text.Pandoc
-> import Text.Pandoc.Error (handleError)
 >
 > markdownToRST :: String -> String
-> markdownToRST = handleError .
+> markdownToRST =
 >   writeRST def {writerReferenceLinks = True} .
->   readMarkdown def
+>   handleError . readMarkdown def
 >
 > main = getContents >>= putStrLn . markdownToRST
 
@@ -60,6 +59,8 @@ module Text.Pandoc
                , module Text.Pandoc.Generic
                -- * Options
                , module Text.Pandoc.Options
+               -- * Error handling
+               , module Text.Pandoc.Error
                -- * Lists of readers and writers
                , readers
                , writers
@@ -67,6 +68,7 @@ module Text.Pandoc
                , Reader (..)
                , mkStringReader
                , readDocx
+               , readOdt
                , readMarkdown
                , readCommonMark
                , readMediaWiki
@@ -85,7 +87,7 @@ module Text.Pandoc
                , readTxt2TagsNoMacros
                , readEPUB
                -- * Writers: converting /from/ Pandoc format
-               , Writer (..)
+              , Writer (..)
                , writeNative
                , writeJSON
                , writeMarkdown
@@ -103,6 +105,7 @@ module Text.Pandoc
                , writeMan
                , writeMediaWiki
                , writeDokuWiki
+               , writeZimWiki
                , writeTextile
                , writeRTF
                , writeODT
@@ -114,14 +117,15 @@ module Text.Pandoc
                , writeHaddock
                , writeCommonMark
                , writeCustom
+               , writeTEI
                -- * Rendering templates and default templates
                , module Text.Pandoc.Templates
-               -- * Version
-               , pandocVersion
                -- * Miscellaneous
                , getReader
                , getWriter
+               , getDefaultExtensions
                , ToJsonFilter(..)
+               , pandocVersion
              ) where
 
 import Text.Pandoc.Definition
@@ -141,6 +145,7 @@ import Text.Pandoc.Readers.Native
 import Text.Pandoc.Readers.Haddock
 import Text.Pandoc.Readers.TWiki
 import Text.Pandoc.Readers.Docx
+import Text.Pandoc.Readers.Odt
 import Text.Pandoc.Readers.Txt2Tags
 import Text.Pandoc.Readers.EPUB
 import Text.Pandoc.Writers.Native
@@ -162,31 +167,27 @@ import Text.Pandoc.Writers.Man
 import Text.Pandoc.Writers.RTF
 import Text.Pandoc.Writers.MediaWiki
 import Text.Pandoc.Writers.DokuWiki
+import Text.Pandoc.Writers.ZimWiki
 import Text.Pandoc.Writers.Textile
 import Text.Pandoc.Writers.Org
 import Text.Pandoc.Writers.AsciiDoc
 import Text.Pandoc.Writers.Haddock
 import Text.Pandoc.Writers.CommonMark
 import Text.Pandoc.Writers.Custom
+import Text.Pandoc.Writers.TEI
 import Text.Pandoc.Templates
 import Text.Pandoc.Options
-import Text.Pandoc.Shared (safeRead, warn, mapLeft)
+import Text.Pandoc.Shared (safeRead, warn, mapLeft, pandocVersion)
 import Text.Pandoc.MediaBag (MediaBag)
 import Text.Pandoc.Error
 import Data.Aeson
 import qualified Data.ByteString.Lazy as BL
 import Data.List (intercalate)
-import Data.Version (showVersion)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Text.Parsec
 import Text.Parsec.Error
 import qualified Text.Pandoc.UTF8 as UTF8
-import Paths_pandoc (version)
-
--- | Version number of pandoc library.
-pandocVersion :: String
-pandocVersion = showVersion version
 
 parseFormatSpec :: String
                 -> Either ParseError (String, Set Extension -> Set Extension)
@@ -194,7 +195,7 @@ parseFormatSpec = parse formatSpec ""
   where formatSpec = do
           name <- formatName
           extMods <- many extMod
-          return (name, foldl (.) id extMods)
+          return (name, \x -> foldl (flip ($)) x extMods)
         formatName = many1 $ noneOf "-+"
         extMod = do
           polarity <- oneOf "-+"
@@ -212,19 +213,27 @@ parseFormatSpec = parse formatSpec ""
 data Reader = StringReader (ReaderOptions -> String -> IO (Either PandocError Pandoc))
               | ByteStringReader (ReaderOptions -> BL.ByteString -> IO (Either PandocError (Pandoc,MediaBag)))
 
-mkStringReader :: (ReaderOptions -> String -> (Either PandocError Pandoc)) -> Reader
+mkStringReader :: (ReaderOptions -> String -> Either PandocError Pandoc) -> Reader
 mkStringReader r = StringReader (\o s -> return $ r o s)
 
 mkStringReaderWithWarnings :: (ReaderOptions -> String -> Either PandocError (Pandoc, [String])) -> Reader
-mkStringReaderWithWarnings r  = StringReader $ \o s -> do
+mkStringReaderWithWarnings r  = StringReader $ \o s ->
   case r o s of
     Left err -> return $ Left err
     Right (doc, warnings) -> do
       mapM_ warn warnings
       return (Right doc)
 
-mkBSReader :: (ReaderOptions -> BL.ByteString -> (Either PandocError (Pandoc, MediaBag))) -> Reader
+mkBSReader :: (ReaderOptions -> BL.ByteString -> Either PandocError (Pandoc, MediaBag)) -> Reader
 mkBSReader r = ByteStringReader (\o s -> return $ r o s)
+
+mkBSReaderWithWarnings :: (ReaderOptions -> BL.ByteString -> Either PandocError (Pandoc, MediaBag, [String])) -> Reader
+mkBSReaderWithWarnings r = ByteStringReader $ \o s ->
+  case r o s of
+    Left err -> return $ Left err
+    Right (doc, mediaBag, warnings) -> do
+      mapM_ warn warnings
+      return $ Right (doc, mediaBag)
 
 -- | Association list of formats and readers.
 readers :: [(String, Reader)]
@@ -246,7 +255,8 @@ readers = [ ("native"       , StringReader $ \_ s -> return $ readNative s)
            ,("latex"        , mkStringReader readLaTeX)
            ,("haddock"      , mkStringReader readHaddock)
            ,("twiki"        , mkStringReader readTWiki)
-           ,("docx"         , mkBSReader readDocx)
+           ,("docx"         , mkBSReaderWithWarnings readDocxWithWarnings)
+           ,("odt"          , mkBSReader readOdt)
            ,("t2t"          , mkStringReader readTxt2TagsNoMacros)
            ,("epub"         , mkBSReader readEPUB)
            ]
@@ -270,7 +280,7 @@ writers = [
   ,("html"         , PureStringWriter writeHtmlString)
   ,("html5"        , PureStringWriter $ \o ->
      writeHtmlString o{ writerHtml5 = True })
-  ,("icml"         , PureStringWriter writeICML)
+  ,("icml"         , IOStringWriter writeICML)
   ,("s5"           , PureStringWriter $ \o ->
      writeHtmlString o{ writerSlideVariant = S5Slides
                       , writerTableOfContents = False })
@@ -285,6 +295,8 @@ writers = [
      writeHtmlString o{ writerSlideVariant = RevealJsSlides
                       , writerHtml5 = True })
   ,("docbook"      , PureStringWriter writeDocbook)
+  ,("docbook5"     , PureStringWriter $ \o ->
+     writeDocbook o{ writerDocbook5 = True })
   ,("opml"         , PureStringWriter writeOPML)
   ,("opendocument" , PureStringWriter writeOpenDocument)
   ,("latex"        , PureStringWriter writeLaTeX)
@@ -302,12 +314,14 @@ writers = [
   ,("rst"          , PureStringWriter writeRST)
   ,("mediawiki"    , PureStringWriter writeMediaWiki)
   ,("dokuwiki"     , PureStringWriter writeDokuWiki)
+  ,("zimwiki"      , PureStringWriter writeZimWiki)
   ,("textile"      , PureStringWriter writeTextile)
   ,("rtf"          , IOStringWriter writeRTFWithEmbeddedImages)
   ,("org"          , PureStringWriter writeOrg)
   ,("asciidoc"     , PureStringWriter writeAsciiDoc)
   ,("haddock"      , PureStringWriter writeHaddock)
   ,("commonmark"   , PureStringWriter writeCommonMark)
+  ,("tei"          , PureStringWriter writeTEI)
   ]
 
 getDefaultExtensions :: String -> Set Extension
@@ -316,15 +330,15 @@ getDefaultExtensions "markdown_phpextra" = phpMarkdownExtraExtensions
 getDefaultExtensions "markdown_mmd" = multimarkdownExtensions
 getDefaultExtensions "markdown_github" = githubMarkdownExtensions
 getDefaultExtensions "markdown"        = pandocExtensions
-getDefaultExtensions "plain"           = pandocExtensions
-getDefaultExtensions "org"             = Set.fromList [Ext_citations]
+getDefaultExtensions "plain"           = plainExtensions
+getDefaultExtensions "org"             = Set.fromList [Ext_citations,
+                                                       Ext_auto_identifiers]
 getDefaultExtensions "textile"         = Set.fromList [Ext_auto_identifiers]
 getDefaultExtensions "html"            = Set.fromList [Ext_auto_identifiers,
                                                        Ext_native_divs,
                                                        Ext_native_spans]
 getDefaultExtensions "html5"           = getDefaultExtensions "html"
-getDefaultExtensions "epub"            = Set.fromList [Ext_auto_identifiers,
-                                                       Ext_raw_html,
+getDefaultExtensions "epub"            = Set.fromList [Ext_raw_html,
                                                        Ext_native_divs,
                                                        Ext_native_spans,
                                                        Ext_epub_html_exts]
@@ -334,7 +348,7 @@ getDefaultExtensions _                 = Set.fromList [Ext_auto_identifiers]
 getReader :: String -> Either String Reader
 getReader s =
   case parseFormatSpec s of
-       Left e  -> Left $ intercalate "\n" $ [m | Message m <- errorMessages e]
+       Left e  -> Left $ intercalate "\n" [m | Message m <- errorMessages e]
        Right (readerName, setExts) ->
            case lookup readerName readers of
                    Nothing  -> Left $ "Unknown reader: " ++ readerName
@@ -349,7 +363,7 @@ getReader s =
 getWriter :: String -> Either String Writer
 getWriter s
   = case parseFormatSpec s of
-         Left e  -> Left $ intercalate "\n" $ [m | Message m <- errorMessages e]
+         Left e  -> Left $ intercalate "\n" [m | Message m <- errorMessages e]
          Right (writerName, setExts) ->
              case lookup writerName writers of
                      Nothing -> Left $ "Unknown writer: " ++ writerName

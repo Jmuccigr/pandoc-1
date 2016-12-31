@@ -1,54 +1,55 @@
 version=$(shell grep '^Version:' pandoc.cabal | awk '{print $$2;}')
-setup=dist/setup/setup
-PREFIX ?= /usr/local
+pandoc=$(shell find dist -name pandoc -type f -exec ls -t {} \; | head -1)
 
 quick:
-	cabal configure --enable-tests --disable-optimization
-	cabal build
+	stack install --flag 'pandoc:embed_data_files' --fast --test --test-arguments='-j4'
 
 full:
-	cabal configure --enable-tests --enable-optimization -ftrypandoc -fmake-pandoc-man-pages -fembed_data_files --enable-benchmarks
-	cabal build
-	cabal haddock
-
-deps:
-	cabal install --only-dependencies --enable-tests -ftrypandoc -fmake-pandoc-man-pages -fembed_data_files --enable-benchmarks
-
-prof:
-	cabal configure --enable-library-profiling --enable-executable-profiling --enable-optimization --enable-tests
-	cabal build
+	stack install --flag 'pandoc:embed_data_files' --test --test-arguments='-j4' --pedantic
+	stack haddock
 
 test:
-	cabal test
+	stack test --test-arguments='-j4'
 
 bench:
-	cabal bench
+	stack bench
 
-install: full
-	cabal copy
-	cabal register
+changes_github:
+	pandoc --filter extract-changes.hs changelog -t markdown_github | pbcopy
 
-dist: man
+dist: man/pandoc.1
 	cabal sdist
 	rm -rf "pandoc-${version}"
 	tar xvzf dist/pandoc-${version}.tar.gz
 	cd pandoc-${version}
-	cabal configure ${CABALARGS} && cabal build && cabal test && cd .. && rm -rf "pandoc-${version}"
+	stack setup && stack test && cd .. && rm -rf "pandoc-${version}"
 
-debpkg:
-	./make_deb.sh
+debpkg: man/pandoc.1
+	make -C deb
 
-osxpkg:
-	./make_osx_package.sh
+osxpkg: man/pandoc.1
+	./osx/make_osx_package.sh
 
-%.1: %.1.template README
-	${makemanpages}
+winpkg: pandoc-$(version)-windows.msi
 
-%.5: %.5.template README
-	${makemanpages}
+pandoc-$(version)-windows.msi:
+	wget 'https://ci.appveyor.com/api/projects/jgm/pandoc/artifacts/windows/pandoc.msi?branch=master' -O pandoc.msi && \
+	osslsigncode sign -pkcs12 ~/Private/ComodoCodeSigning.exp2017.p12 -in pandoc.msi -i http://johnmacfarlane.net/ -t http://timestamp.comodoca.com/ -out $@ -askpass
+	rm pandoc.msi
+
+man/pandoc.1: MANUAL.txt man/pandoc.1.template
+	pandoc $< -t man -s --template man/pandoc.1.template \
+		--filter man/capitalizeHeaders.hs \
+		--filter man/removeNotes.hs \
+		--filter man/removeLinks.hs \
+		--variable version="pandoc $(version)" \
+		-o $@
+
+download_stats:
+	curl https://api.github.com/repos/jgm/pandoc/releases | \
+		jq -r '.[] | .assets | .[] | "\(.download_count)\t\(.name)"'
 
 clean:
-	cabal clean
-	-rm -rf $(BINDIST) $(BINDIST).tar.gz
+	stack clean
 
-.PHONY: deps quick full install man clean test bench haddock osxpkg dist bindist prof
+.PHONY: deps quick full install clean test bench changes_github osxpkg dist prof download_stats

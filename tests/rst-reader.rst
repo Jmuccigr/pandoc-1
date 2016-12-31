@@ -378,6 +378,8 @@ Links
 
 Explicit:  a `URL </url/>`_.
 
+Explicit with no label:  `<foo>`_.
+
 Two anonymous links:  `the first`__ and `the second`__
 
 __ /url1/
@@ -387,6 +389,8 @@ Reference links:  `link1`_ and `link2`_ and link1_ again.
 
 .. _link1: /url1/
 .. _`link2`: /url2/
+
+Another `style of reference link <link1_>`_.
 
 Here's a `link with an ampersand in the URL`_.
 
@@ -611,10 +615,10 @@ And some inline haskell :haskell:`fmap id [1,2..10]`.
 
 .. role:: indirect(code)
 
-.. role:: python(indirect)
+.. role:: py(indirect)
    :language: python
 
-Indirect python role :python:`[x*x for x in [1,2,3,4,5]]`.
+Indirect python role :py:`[x*x for x in [1,2,3,4,5]]`.
 
 .. role:: different-indirect(code)
    :language: c

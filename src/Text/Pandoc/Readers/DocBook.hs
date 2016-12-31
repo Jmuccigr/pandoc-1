@@ -5,19 +5,18 @@ import Text.Pandoc.Options
 import Text.Pandoc.Definition
 import Text.Pandoc.Builder
 import Text.XML.Light
-import Text.Pandoc.Compat.TagSoupEntity (lookupEntity)
+import Text.HTML.TagSoup.Entity (lookupEntity)
 import Data.Either (rights)
 import Data.Generics
-import Data.Monoid
 import Data.Char (isSpace)
 import Control.Monad.State
-import Control.Applicative ((<$>))
 import Data.List (intersperse)
 import Data.Maybe (fromMaybe)
 import Text.TeXMath (readMathML, writeTeX)
 import Text.Pandoc.Error (PandocError)
-import Text.Pandoc.Compat.Except
+import Control.Monad.Except
 import Data.Default
+import Data.Foldable (asum)
 
 {-
 
@@ -167,7 +166,9 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] glossseealso - A cross-reference from one GlossEntry to another
 [x] glossterm - A glossary term
 [ ] graphic - A displayed graphical object (not an inline)
+    Note: in DocBook v5 `graphic` is discarded
 [ ] graphicco - A graphic that contains callout areas
+    Note: in DocBook v5 `graphicco` is discarded
 [ ] group - A group of elements in a CmdSynopsis
 [ ] guibutton - The text on a button in a GUI
 [ ] guiicon - Graphic and/or text appearing as a icon in a GUI
@@ -180,8 +181,9 @@ List of all DocBook tags, with [x] indicating implemented,
 [ ] holder - The name of the individual or organization that holds a copyright
 [o] honorific - The title of a person
 [ ] html:form - An HTML form
-[ ] imagedata - Pointer to external image data
-[ ] imageobject - A wrapper for image data and its associated meta-information
+[x] imagedata - Pointer to external image data (only `fileref` attribute
+    implemented but not `entityref` which would require parsing of the DTD)
+[x] imageobject - A wrapper for image data and its associated meta-information
 [ ] imageobjectco - A wrapper for an image object with callouts
 [x] important - An admonition set off from the text
 [x] index - An index
@@ -191,7 +193,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] indexterm - A wrapper for terms to be indexed
 [x] info - A wrapper for information about a component or other block. (DocBook v5)
 [x] informalequation - A displayed mathematical equation without a title
-[ ] informalexample - A displayed example without a title
+[x] informalexample - A displayed example without a title
 [ ] informalfigure - A untitled figure
 [ ] informaltable - A table without a title
 [ ] initializer - The initializer for a FieldSynopsis
@@ -495,7 +497,7 @@ List of all DocBook tags, with [x] indicating implemented,
 [x] warning - An admonition set off from the text
 [x] wordasword - A word meant specifically as a word and not representing
     anything else
-[ ] xref - A cross reference to another part of the document
+[x] xref - A cross reference to another part of the document
 [ ] year - The year of publication of a document
 [x] ?asciidoc-br? - line break from asciidoc docbook output
 -}
@@ -508,6 +510,7 @@ data DBState = DBState{ dbSectionLevel :: Int
                       , dbAcceptsMeta  :: Bool
                       , dbBook         :: Bool
                       , dbFigureTitle  :: Inlines
+                      , dbContent      :: [Content]
                       } deriving Show
 
 instance Default DBState where
@@ -516,13 +519,14 @@ instance Default DBState where
                , dbMeta = mempty
                , dbAcceptsMeta = False
                , dbBook = False
-               , dbFigureTitle = mempty }
+               , dbFigureTitle = mempty
+               , dbContent = [] }
 
 
 readDocBook :: ReaderOptions -> String -> Either PandocError Pandoc
 readDocBook _ inp  = (\blocks -> Pandoc (dbMeta st') (toList . mconcat $ blocks)) <$>  bs
-  where (bs , st') = flip runState def . runExceptT . mapM parseBlock . normalizeTree . parseXML $ inp'
-        inp' = handleInstructions inp
+  where (bs , st') = flip runState (def{ dbContent = tree }) . runExceptT . mapM parseBlock $ tree
+        tree = normalizeTree . parseXML . handleInstructions $ inp
 
 -- We treat <?asciidoc-br?> specially (issue #1236), converting it
 -- to <br/>, since xml-light doesn't parse the instruction correctly.
@@ -560,7 +564,7 @@ normalizeTree = everywhere (mkT go)
         go xs = xs
 
 convertEntity :: String -> String
-convertEntity e = maybe (map toUpper e) (:[]) (lookupEntity e)
+convertEntity e = maybe (map toUpper e) id (lookupEntity e)
 
 -- convenience function to get an attribute value, defaulting to ""
 attrValue :: String -> Element -> String
@@ -588,8 +592,6 @@ checkInMeta p = do
   when accepts p
   return mempty
 
-
-
 addMeta :: ToMetaValue a => String -> a -> DB ()
 addMeta field val = modify (setMeta field val)
 
@@ -608,6 +610,7 @@ isBlockElement (Elem e) = qName (elName e) `elem` blocktags
            "important","caution","note","tip","warning","qandadiv",
            "question","answer","abstract","itemizedlist","orderedlist",
            "variablelist","article","book","table","informaltable",
+           "informalexample", "linegroup",
            "screen","programlisting","example","calloutlist"]
 isBlockElement _ = False
 
@@ -627,18 +630,33 @@ addToStart toadd bs =
 
 -- function that is used by both mediaobject (in parseBlock)
 -- and inlinemediaobject (in parseInline)
-getImage :: Element -> DB Inlines
-getImage e = do
-  imageUrl <- case filterChild (named "imageobject") e of
-                Nothing  -> return mempty
-                Just z   -> case filterChild (named "imagedata") z of
-                              Nothing -> return mempty
-                              Just i -> return $ attrValue "fileref" i
-  caption <- case filterChild
-                  (\x -> named "caption" x || named "textobject" x) e of
-               Nothing  -> gets dbFigureTitle
-               Just z   -> mconcat <$> (mapM parseInline $ elContent z)
-  return $ image imageUrl "" caption
+-- A DocBook mediaobject is a wrapper around a set of alternative presentations
+getMediaobject :: Element -> DB Inlines
+getMediaobject e = do
+  (imageUrl, attr) <-
+    case filterChild (named "imageobject") e of
+      Nothing  -> return (mempty, nullAttr)
+      Just z   -> case filterChild (named "imagedata") z of
+                    Nothing -> return (mempty, nullAttr)
+                    Just i  -> let atVal a = attrValue a i
+                                   w = case atVal "width" of
+                                         "" -> []
+                                         d  -> [("width", d)]
+                                   h = case atVal "depth" of
+                                         "" -> []
+                                         d  -> [("height", d)]
+                                   atr = (atVal "id", words $ atVal "role", w ++ h)
+                               in  return (atVal "fileref", atr)
+  let getCaption el = case filterChild (\x -> named "caption" x
+                                            || named "textobject" x
+                                            || named "alt" x) el of
+                        Nothing -> return mempty
+                        Just z  -> mconcat <$> (mapM parseInline $ elContent z)
+  figTitle <- gets dbFigureTitle
+  let (caption, title) = if isNull figTitle
+                            then (getCaption e, "")
+                            else (return figTitle, "fig:")
+  liftM (imageWith attr imageUrl title) caption
 
 getBlocks :: Element -> DB Blocks
 getBlocks e =  mconcat <$> (mapM parseBlock $ elContent e)
@@ -734,7 +752,7 @@ parseBlock (Elem e) =
             <$> listitems
         "variablelist" -> definitionList <$> deflistitems
         "figure" -> getFigure e
-        "mediaobject" -> para <$> getImage e
+        "mediaobject" -> para <$> getMediaobject e
         "caption" -> return mempty
         "info" -> metaBlock
         "articleinfo" -> metaBlock
@@ -757,6 +775,9 @@ parseBlock (Elem e) =
         "book" -> modify (\st -> st{ dbBook = True }) >>  getBlocks e
         "table" -> parseTable
         "informaltable" -> parseTable
+        "informalexample" -> divWith ("", ["informalexample"], []) <$>
+                             getBlocks e
+        "linegroup" -> lineBlock <$> lineItems
         "literallayout" -> codeBlockWithLang
         "screen" -> codeBlockWithLang
         "programlisting" -> codeBlockWithLang
@@ -878,6 +899,7 @@ parseBlock (Elem e) =
                      let ident = attrValue "id" e
                      modify $ \st -> st{ dbSectionLevel = n - 1 }
                      return $ headerWith (ident,[],[]) n' headerText <> b
+         lineItems = mapM getInlines $ filterChildren (named "line") e
          metaBlock = acceptingMetadata (getBlocks e) >> return mempty
 
 getInlines :: Element -> DB Inlines
@@ -894,7 +916,7 @@ elementToStr x = x
 parseInline :: Content -> DB Inlines
 parseInline (Text (CData _ s _)) = return $ text s
 parseInline (CRef ref) =
-  return $ maybe (text $ map toUpper ref) (text . (:[])) $ lookupEntity ref
+  return $ maybe (text $ map toUpper ref) (text) $ lookupEntity ref
 parseInline (Elem e) =
   case qName (elName e) of
         "equation" -> equation displayMath
@@ -902,7 +924,7 @@ parseInline (Elem e) =
         "inlineequation" -> equation math
         "subscript" -> subscript <$> innerInlines
         "superscript" -> superscript <$> innerInlines
-        "inlinemediaobject" -> getImage e
+        "inlinemediaobject" -> getMediaobject e
         "quote" -> do
             qt <- gets dbQuoteType
             let qt' = if qt == SingleQuote then DoubleQuote else SingleQuote
@@ -938,7 +960,15 @@ parseInline (Elem e) =
         "keycombo" -> keycombo <$> (mapM parseInline $ elContent e)
         "menuchoice" -> menuchoice <$> (mapM parseInline $
                                         filter isGuiMenu $ elContent e)
-        "xref" -> return $ str "?" -- so at least you know something is there
+        "xref" -> do
+            content <- dbContent <$> get
+            let linkend = attrValue "linkend" e
+            let title = case attrValue "endterm" e of
+                            ""      -> maybe "???" xrefTitleByElem
+                                         (findElementById linkend content)
+                            endterm -> maybe "???" strContent
+                                         (findElementById endterm content)
+            return $ link ('#' : linkend) "" (text title)
         "email" -> return $ link ("mailto:" ++ strContent e) ""
                           $ str $ strContent e
         "uri" -> return $ link (strContent e) "" $ str $ strContent e
@@ -949,7 +979,8 @@ parseInline (Elem e) =
                                Just h -> h
                                _      -> ('#' : attrValue "linkend" e)
              let ils' = if ils == mempty then str href else ils
-             return $ link href "" ils'
+             let attr = (attrValue "id" e, words $ attrValue "role" e, [])
+             return $ linkWith attr href "" ils'
         "foreignphrase" -> emph <$> innerInlines
         "emphasis" -> case attrValue "role" e of
                              "bold"   -> strong <$> innerInlines
@@ -999,3 +1030,26 @@ parseInline (Elem e) =
          isGuiMenu (Elem x) = named "guimenu" x || named "guisubmenu" x ||
                               named "guimenuitem" x
          isGuiMenu _        = False
+
+         findElementById idString content
+            = asum [filterElement (\x -> attrValue "id" x == idString) el | Elem el <- content]
+
+         -- Use the 'xreflabel' attribute for getting the title of a xref link;
+         -- if there's no such attribute, employ some heuristics based on what
+         -- docbook-xsl does.
+         xrefTitleByElem el
+             | not (null xrefLabel) = xrefLabel
+             | otherwise            = case qName (elName el) of
+                  "chapter"      -> descendantContent "title" el
+                  "sect1"        -> descendantContent "title" el
+                  "sect2"        -> descendantContent "title" el
+                  "sect3"        -> descendantContent "title" el
+                  "sect4"        -> descendantContent "title" el
+                  "sect5"        -> descendantContent "title" el
+                  "cmdsynopsis"  -> descendantContent "command" el
+                  "funcsynopsis" -> descendantContent "function" el
+                  _              -> qName (elName el) ++ "_title"
+          where
+            xrefLabel = attrValue "xreflabel" el
+            descendantContent name = maybe "???" strContent
+                                   . filterElementName (\n -> qName n == name)

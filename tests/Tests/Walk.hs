@@ -6,9 +6,8 @@ import Text.Pandoc.Walk
 import Test.Framework
 import Tests.Helpers
 import Data.Char (toUpper)
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 import Data.Generics
-import Data.Monoid
 
 tests :: [Test]
 tests = [ testGroup "Walk"

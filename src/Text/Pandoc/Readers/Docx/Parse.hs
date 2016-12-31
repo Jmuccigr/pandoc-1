@@ -1,7 +1,7 @@
 {-# LANGUAGE PatternGuards, ViewPatterns, FlexibleInstances #-}
 
 {-
-Copyright (C) 2014 Jesse Rosenthal <jrosenthal@jhu.edu>
+Copyright (C) 2014-2016 Jesse Rosenthal <jrosenthal@jhu.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -20,7 +20,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 {- |
  Module : Text.Pandoc.Readers.Docx.Parse
- Copyright : Copyright (C) 2014 Jesse Rosenthal
+ Copyright : Copyright (C) 2014-2016 Jesse Rosenthal
  License : GNU GPL, version 2 or above
 
  Maintainer : Jesse Rosenthal <jrosenthal@jhu.edu>
@@ -35,6 +35,7 @@ module Text.Pandoc.Readers.Docx.Parse ( Docx(..)
                                       , Body(..)
                                       , BodyPart(..)
                                       , TblLook(..)
+                                      , Extent
                                       , ParPart(..)
                                       , Run(..)
                                       , RunElem(..)
@@ -49,6 +50,7 @@ module Text.Pandoc.Readers.Docx.Parse ( Docx(..)
                                       , Row(..)
                                       , Cell(..)
                                       , archiveToDocx
+                                      , archiveToDocxWithWarnings
                                       ) where
 import Codec.Archive.Zip
 import Text.XML.Light
@@ -59,35 +61,39 @@ import Data.Bits ((.|.))
 import qualified Data.ByteString.Lazy as B
 import qualified Text.Pandoc.UTF8 as UTF8
 import Control.Monad.Reader
-import Control.Applicative ((<$>), (<|>))
+import Control.Monad.State
+import Control.Applicative ((<|>))
 import qualified Data.Map as M
-import Text.Pandoc.Compat.Except
+import Control.Monad.Except
+import Text.Pandoc.Shared (safeRead, filteredFilesFromArchive)
 import Text.TeXMath.Readers.OMML (readOMML)
-import Text.Pandoc.Readers.Docx.Fonts (getUnicode, Font(..))
+import Text.TeXMath.Unicode.Fonts (getUnicode, stringToFont, Font(..))
 import Text.TeXMath (Exp)
 import Text.Pandoc.Readers.Docx.Util
 import Data.Char (readLitChar, ord, chr, isDigit)
 
 data ReaderEnv = ReaderEnv { envNotes         :: Notes
+                           , envComments      :: Comments
                            , envNumbering     :: Numbering
                            , envRelationships :: [Relationship]
                            , envMedia         :: Media
                            , envFont          :: Maybe Font
                            , envCharStyles    :: CharStyleMap
                            , envParStyles     :: ParStyleMap
+                           , envLocation      :: DocumentLocation
                            }
                deriving Show
+
+data ReaderState = ReaderState { stateWarnings :: [String] }
+                 deriving Show
 
 data DocxError = DocxError | WrongElem
                deriving Show
 
-instance Error DocxError where
-  noMsg = WrongElem
+type D = ExceptT DocxError (ReaderT ReaderEnv (State ReaderState))
 
-type D = ExceptT DocxError (Reader ReaderEnv)
-
-runD :: D a -> ReaderEnv -> Either DocxError a
-runD dx re = runReader (runExceptT dx ) re
+runD :: D a -> ReaderEnv -> ReaderState -> (Either DocxError a, ReaderState)
+runD dx re rs = runState (runReaderT (runExceptT dx) re) rs
 
 maybeToD :: Maybe a -> D a
 maybeToD (Just a) = return a
@@ -140,13 +146,19 @@ data AbstractNumb = AbstractNumb String [Level]
 -- (ilvl, format, string, start)
 type Level = (String, String, String, Maybe Integer)
 
-data Relationship = Relationship (RelId, Target)
+data DocumentLocation = InDocument | InFootnote | InEndnote
+                      deriving (Eq,Show)
+
+data Relationship = Relationship DocumentLocation RelId Target
                   deriving Show
 
 data Notes = Notes NameSpaces
              (Maybe (M.Map String Element))
              (Maybe (M.Map String Element))
            deriving Show
+
+data Comments = Comments NameSpaces (M.Map String Element)
+              deriving Show
 
 data ParIndentation = ParIndentation { leftParIndent :: Maybe Integer
                                      , rightParIndent :: Maybe Integer
@@ -173,7 +185,7 @@ defaultParagraphStyle = ParagraphStyle { pStyle = []
 
 
 data BodyPart = Paragraph ParagraphStyle [ParPart]
-              | ListItem ParagraphStyle String String Level [ParPart]
+              | ListItem ParagraphStyle String String (Maybe Level) [ParPart]
               | Tbl String TblGrid TblLook [Row]
               | OMathPara [Exp]
               deriving Show
@@ -192,23 +204,30 @@ data Row = Row [Cell]
 data Cell = Cell [BodyPart]
             deriving Show
 
+-- (width, height) in EMUs
+type Extent = Maybe (Double, Double)
+
 data ParPart = PlainRun Run
              | Insertion ChangeId Author ChangeDate [Run]
              | Deletion ChangeId Author ChangeDate [Run]
+             | CommentStart CommentId Author CommentDate [BodyPart]
+             | CommentEnd CommentId
              | BookMark BookMarkId Anchor
              | InternalHyperLink Anchor [Run]
              | ExternalHyperLink URL [Run]
-             | Drawing FilePath B.ByteString
+             | Drawing FilePath String String B.ByteString Extent -- title, alt
+             | Chart                                              -- placeholder for now
              | PlainOMath [Exp]
              deriving Show
 
 data Run = Run RunStyle [RunElem]
          | Footnote [BodyPart]
          | Endnote [BodyPart]
-         | InlineDrawing FilePath B.ByteString
+         | InlineDrawing FilePath String String B.ByteString Extent -- title, alt
+         | InlineChart          -- placeholder
            deriving Show
 
-data RunElem = TextRun String | LnBrk | Tab
+data RunElem = TextRun String | LnBrk | Tab | SoftHyphen | NoBreakHyphen
              deriving Show
 
 data VertAlign = BaseLn | SupScrpt | SubScrpt
@@ -238,26 +257,36 @@ defaultRunStyle = RunStyle { isBold = Nothing
                            , rUnderline = Nothing
                            , rStyle = Nothing}
 
-
 type Target = String
 type Anchor = String
 type URL = String
 type BookMarkId = String
 type RelId = String
 type ChangeId = String
+type CommentId = String
 type Author = String
 type ChangeDate = String
+type CommentDate = String
 
 archiveToDocx :: Archive -> Either DocxError Docx
-archiveToDocx archive = do
+archiveToDocx archive = fst <$> archiveToDocxWithWarnings archive
+
+archiveToDocxWithWarnings :: Archive -> Either DocxError (Docx, [String])
+archiveToDocxWithWarnings archive = do
   let notes     = archiveToNotes archive
+      comments  = archiveToComments archive
       numbering = archiveToNumbering archive
       rels      = archiveToRelationships archive
-      media     = archiveToMedia archive
+      media     = filteredFilesFromArchive archive filePathIsMedia
       (styles, parstyles) = archiveToStyles archive
-      rEnv = ReaderEnv notes numbering rels media Nothing styles parstyles
-  doc <- runD (archiveToDocument archive) rEnv
-  return $ Docx doc
+      rEnv =
+        ReaderEnv notes comments numbering rels media Nothing styles parstyles InDocument
+      rState = ReaderState { stateWarnings = [] }
+      (eitherDoc, st) = runD (archiveToDocument archive) rEnv rState
+  case eitherDoc of
+    Right doc -> Right (Docx doc, stateWarnings st)
+    Left e    -> Left e
+
 
 
 archiveToDocument :: Archive -> D Document
@@ -362,45 +391,49 @@ archiveToNotes zf =
   in
    Notes ns fn en
 
-filePathIsRel :: FilePath -> Bool
-filePathIsRel fp =
-  let (dir, name) = splitFileName fp
+archiveToComments :: Archive -> Comments
+archiveToComments zf =
+  let cmtsElem = findEntryByPath "word/comments.xml" zf
+               >>= (parseXMLDoc . UTF8.toStringLazy . fromEntry)
+      cmts_namespaces = case cmtsElem of
+        Just e -> elemToNameSpaces e
+        Nothing -> []
+      cmts = (elemToComments cmts_namespaces) <$> cmtsElem
   in
-   (dir == "word/_rels/") && ((takeExtension name) == ".rels")
+    case cmts of
+      Just c -> Comments cmts_namespaces c
+      Nothing -> Comments cmts_namespaces M.empty
 
-relElemToRelationship :: Element -> Maybe Relationship
-relElemToRelationship element | qName (elName element) == "Relationship" =
+filePathToRelType :: FilePath -> Maybe DocumentLocation
+filePathToRelType "word/_rels/document.xml.rels" = Just InDocument
+filePathToRelType "word/_rels/footnotes.xml.rels" = Just InFootnote
+filePathToRelType "word/_rels/endnotes.xml.rels" = Just InEndnote
+filePathToRelType _ = Nothing
+
+relElemToRelationship :: DocumentLocation -> Element -> Maybe Relationship
+relElemToRelationship relType element | qName (elName element) == "Relationship" =
   do
     relId <- findAttr (QName "Id" Nothing Nothing) element
     target <- findAttr (QName "Target" Nothing Nothing) element
-    return $ Relationship (relId, target)
-relElemToRelationship _ = Nothing
+    return $ Relationship relType relId target
+relElemToRelationship _ _ = Nothing
 
+filePathToRelationships :: Archive -> FilePath -> [Relationship]
+filePathToRelationships ar fp | Just relType <- filePathToRelType fp
+                              , Just entry <- findEntryByPath fp ar
+                              , Just relElems <- (parseXMLDoc . UTF8.toStringLazy . fromEntry) entry =
+  mapMaybe (relElemToRelationship relType) $ elChildren relElems
+filePathToRelationships _ _ = []
 
 archiveToRelationships :: Archive -> [Relationship]
 archiveToRelationships archive =
-  let relPaths = filter filePathIsRel (filesInArchive archive)
-      entries  = mapMaybe (\f -> findEntryByPath f archive) relPaths
-      relElems = mapMaybe (parseXMLDoc . UTF8.toStringLazy . fromEntry) entries
-      rels =     mapMaybe relElemToRelationship $ concatMap elChildren relElems
-  in
-   rels
+  concatMap (filePathToRelationships archive) $ filesInArchive archive
 
 filePathIsMedia :: FilePath -> Bool
 filePathIsMedia fp =
   let (dir, _) = splitFileName fp
   in
    (dir == "word/media/")
-
-getMediaPair :: Archive -> FilePath -> Maybe (FilePath, B.ByteString)
-getMediaPair zf fp =
-  case findEntryByPath fp zf of
-    Just e -> Just (fp, fromEntry e)
-    Nothing -> Nothing
-
-archiveToMedia :: Archive -> Media
-archiveToMedia zf =
-  mapMaybe (getMediaPair zf) (filter filePathIsMedia (filesInArchive zf))
 
 lookupLevel :: String -> String -> Numbering -> Maybe Level
 lookupLevel numId ilvl (Numbering _ numbs absNumbs) = do
@@ -409,41 +442,35 @@ lookupLevel numId ilvl (Numbering _ numbs absNumbs) = do
   lvl  <- lookup ilvl $ map (\l@(i, _, _, _) -> (i, l)) lvls
   return lvl
 
+
 numElemToNum :: NameSpaces -> Element -> Maybe Numb
-numElemToNum ns element |
-  qName (elName element) == "num" &&
-  qURI (elName element) == (lookup "w" ns) = do
-    numId <- findAttr (QName "numId" (lookup "w" ns) (Just "w")) element
-    absNumId <- findChild (QName "abstractNumId" (lookup "w" ns) (Just "w")) element
-                >>= findAttr (QName "val" (lookup "w" ns) (Just "w"))
-    return $ Numb numId absNumId
+numElemToNum ns element
+  | isElem ns "w" "num" element = do
+      numId <- findAttr (elemName ns "w" "numId") element
+      absNumId <- findChild (elemName ns "w" "abstractNumId") element
+                  >>= findAttr (elemName ns "w" "val")
+      return $ Numb numId absNumId
 numElemToNum _ _ = Nothing
 
 absNumElemToAbsNum :: NameSpaces -> Element -> Maybe AbstractNumb
-absNumElemToAbsNum ns element |
-  qName (elName element) == "abstractNum" &&
-  qURI (elName element) == (lookup "w" ns) = do
-    absNumId <- findAttr
-                (QName "abstractNumId" (lookup "w" ns) (Just "w"))
-                element
-    let levelElems = findChildren
-                 (QName "lvl" (lookup "w" ns) (Just "w"))
-                 element
-        levels = mapMaybe (levelElemToLevel ns) levelElems
-    return $ AbstractNumb absNumId levels
+absNumElemToAbsNum ns element
+  | isElem ns "w" "abstractNum" element = do
+      absNumId <- findAttr (elemName ns "w" "abstractNumId") element
+      let levelElems = findChildren (elemName ns "w" "lvl") element
+          levels = mapMaybe (levelElemToLevel ns) levelElems
+      return $ AbstractNumb absNumId levels
 absNumElemToAbsNum _ _ = Nothing
 
 levelElemToLevel :: NameSpaces -> Element -> Maybe Level
-levelElemToLevel ns element |
-    qName (elName element) == "lvl" &&
-    qURI (elName element) == (lookup "w" ns) = do
-      ilvl <- findAttr (QName "ilvl" (lookup "w" ns) (Just "w")) element
-      fmt <- findChild (QName "numFmt" (lookup "w" ns) (Just "w")) element
-             >>= findAttr (QName "val" (lookup "w" ns) (Just "w"))
-      txt <- findChild (QName "lvlText" (lookup "w" ns) (Just "w")) element
-             >>= findAttr (QName "val" (lookup "w" ns) (Just "w"))
-      let start = findChild (QName "start" (lookup "w" ns) (Just "w")) element
-                  >>= findAttr (QName "val" (lookup "w" ns) (Just "w"))
+levelElemToLevel ns element
+  | isElem ns "w" "lvl" element = do
+      ilvl <- findAttr (elemName ns "w" "ilvl") element
+      fmt <- findChild (elemName ns "w" "numFmt") element
+             >>= findAttr (elemName ns "w" "val")
+      txt <- findChild (elemName ns "w" "lvlText") element
+             >>= findAttr (elemName ns "w" "val")
+      let start = findChild (elemName ns "w" "start") element
+                  >>= findAttr (elemName ns "w" "val")
                   >>= (\s -> listToMaybe (map fst (reads s :: [(Integer, String)])))
       return (ilvl, fmt, txt, start)
 levelElemToLevel _ _ = Nothing
@@ -455,12 +482,8 @@ archiveToNumbering' zf = do
     Just entry -> do
       numberingElem <- (parseXMLDoc . UTF8.toStringLazy . fromEntry) entry
       let namespaces = elemToNameSpaces numberingElem
-          numElems = findChildren
-                     (QName "num" (lookup "w" namespaces) (Just "w"))
-                     numberingElem
-          absNumElems = findChildren
-                        (QName "abstractNum" (lookup "w" namespaces) (Just "w"))
-                        numberingElem
+          numElems = findChildren (elemName namespaces "w" "num") numberingElem
+          absNumElems = findChildren (elemName namespaces "w" "abstractNum") numberingElem
           nums = mapMaybe (numElemToNum namespaces) numElems
           absNums = mapMaybe (absNumElemToAbsNum namespaces) absNumElems
       return $ Numbering namespaces nums absNums
@@ -479,6 +502,18 @@ elemToNotes ns notetype element
       in
        Just $ M.fromList $ pairs
 elemToNotes _ _ _ = Nothing
+
+elemToComments :: NameSpaces -> Element -> M.Map String Element
+elemToComments ns element
+  | isElem ns "w" "comments" element =
+      let pairs = mapMaybe
+                  (\e -> findAttr (elemName ns "w" "id") e >>=
+                         (\a -> Just (a, e)))
+                  (findChildren (elemName ns "w" "comment") element)
+      in
+       M.fromList $ pairs
+elemToComments _ _ = M.empty
+
 
 ---------------------------------------------
 ---------------------------------------------
@@ -525,13 +560,13 @@ elemToParIndentation :: NameSpaces -> Element -> Maybe ParIndentation
 elemToParIndentation ns element | isElem ns "w" "ind" element =
   Just $ ParIndentation {
     leftParIndent =
-       findAttr (QName "left" (lookup "w" ns) (Just "w")) element >>=
+       findAttr (elemName ns "w" "left") element >>=
        stringToInteger
     , rightParIndent =
-      findAttr (QName "right" (lookup "w" ns) (Just "w")) element >>=
+      findAttr (elemName ns "w" "right") element >>=
       stringToInteger
     , hangingParIndent =
-      findAttr (QName "hanging" (lookup "w" ns) (Just "w")) element >>=
+      findAttr (elemName ns "w" "hanging") element >>=
       stringToInteger}
 elemToParIndentation _ _ = Nothing
 
@@ -558,23 +593,21 @@ elemToBodyPart ns element
     let parstyle = elemToParagraphStyle ns element sty
     parparts <- mapD (elemToParPart ns) (elChildren element)
     num <- asks envNumbering
-    case lookupLevel numId lvl num of
-     Just levelInfo -> return $ ListItem parstyle numId lvl levelInfo parparts
-     Nothing        -> throwError WrongElem
+    let levelInfo = lookupLevel numId lvl num
+    return $ ListItem parstyle numId lvl levelInfo parparts
 elemToBodyPart ns element
   | isElem ns "w" "p" element = do
       sty <- asks envParStyles
       let parstyle = elemToParagraphStyle ns element sty
       parparts <- mapD (elemToParPart ns) (elChildren element)
-      case pNumInfo parstyle of
-       Just (numId, lvl) -> do
-         num <- asks envNumbering
-         case lookupLevel numId lvl num of
-          Just levelInfo ->
-            return $ ListItem parstyle numId lvl levelInfo parparts
-          Nothing         ->
-            throwError WrongElem
-       Nothing -> return $ Paragraph parstyle parparts
+      -- Word uses list enumeration for numbered headings, so we only
+      -- want to infer a list from the styles if it is NOT a heading.
+      case pHeading parstyle of
+        Nothing | Just (numId, lvl) <- pNumInfo parstyle -> do
+                    num <- asks envNumbering
+                    let levelInfo = lookupLevel numId lvl num
+                    return $ ListItem parstyle numId lvl levelInfo parparts
+        _ -> return $ Paragraph parstyle parparts
 elemToBodyPart ns element
   | isElem ns "w" "tbl" element = do
     let caption' = findChild (elemName ns "w" "tblPr") element
@@ -596,13 +629,16 @@ elemToBodyPart ns element
     return $ Tbl caption grid tblLook rows
 elemToBodyPart _ _ = throwError WrongElem
 
-lookupRelationship :: RelId -> [Relationship] -> Maybe Target
-lookupRelationship relid rels =
-  lookup relid (map (\(Relationship pair) -> pair) rels)
+lookupRelationship :: DocumentLocation -> RelId -> [Relationship] -> Maybe Target
+lookupRelationship docLocation relid rels =
+  lookup (docLocation, relid) pairs
+  where
+    pairs = map (\(Relationship loc relid' target) -> ((loc, relid'), target)) rels
 
 expandDrawingId :: String -> D (FilePath, B.ByteString)
 expandDrawingId s = do
-  target <- asks (lookupRelationship s . envRelationships)
+  location <- asks envLocation
+  target <- asks (lookupRelationship location s . envRelationships)
   case target of
     Just filepath -> do
       bytes <- asks (lookup ("word/" ++ filepath) . envMedia)
@@ -611,16 +647,31 @@ expandDrawingId s = do
         Nothing -> throwError DocxError
     Nothing -> throwError DocxError
 
+getTitleAndAlt :: NameSpaces -> Element -> (String, String)
+getTitleAndAlt ns element =
+  let mbDocPr = findChild (elemName ns "wp" "inline") element >>=
+                findChild (elemName ns "wp" "docPr")
+      title = case mbDocPr >>= findAttr (elemName ns "" "title") of
+                Just title' -> title'
+                Nothing     -> ""
+      alt = case mbDocPr >>= findAttr (elemName ns "" "descr") of
+              Just alt' -> alt'
+              Nothing   -> ""
+  in (title, alt)
+
 elemToParPart :: NameSpaces -> Element -> D ParPart
 elemToParPart ns element
   | isElem ns "w" "r" element
-  , Just _ <- findChild (elemName ns "w" "drawing") element =
-    let a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
-        drawing = findElement (QName "blip" (Just a_ns) (Just "a")) element
-                  >>= findAttr (QName "embed" (lookup "r" ns) (Just "r"))
+  , Just drawingElem <- findChild (elemName ns "w" "drawing") element
+  , pic_ns <- "http://schemas.openxmlformats.org/drawingml/2006/picture"
+  , Just picElem <- findElement (QName "pic" (Just pic_ns) (Just "pic")) drawingElem
+  = let (title, alt) = getTitleAndAlt ns drawingElem
+        a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        drawing = findElement (QName "blip" (Just a_ns) (Just "a")) picElem
+                  >>= findAttr (elemName ns "r" "embed")
     in
      case drawing of
-       Just s -> expandDrawingId s >>= (\(fp, bs) -> return $ Drawing fp bs)
+       Just s -> expandDrawingId s >>= (\(fp, bs) -> return $ Drawing fp title alt bs $ elemToExtent drawingElem)
        Nothing -> throwError WrongElem
 -- The below is an attempt to deal with images in deprecated vml format.
 elemToParPart ns element
@@ -630,20 +681,28 @@ elemToParPart ns element
                   >>= findAttr (elemName ns "r" "id")
     in
      case drawing of
-       Just s -> expandDrawingId s >>= (\(fp, bs) -> return $ Drawing fp bs)
+       -- Todo: check out title and attr for deprecated format.
+       Just s -> expandDrawingId s >>= (\(fp, bs) -> return $ Drawing fp "" "" bs Nothing)
        Nothing -> throwError WrongElem
+-- Chart
+elemToParPart ns element
+  | isElem ns "w" "r" element
+  , Just drawingElem <- findChild (elemName ns "w" "drawing") element
+  , c_ns <- "http://schemas.openxmlformats.org/drawingml/2006/chart"
+  , Just _ <- findElement (QName "chart" (Just c_ns) (Just "c")) drawingElem
+  = return Chart                       
 elemToParPart ns element
   | isElem ns "w" "r" element =
     elemToRun ns element >>= (\r -> return $ PlainRun r)
 elemToParPart ns element
-  | isElem ns "w" "ins" element
+  | isElem ns "w" "ins" element || isElem ns "w" "moveTo" element
   , Just cId <- findAttr (elemName ns "w" "id") element
   , Just cAuthor <- findAttr (elemName ns "w" "author") element
   , Just cDate <- findAttr (elemName ns "w" "date") element = do
     runs <- mapD (elemToRun ns) (elChildren element)
     return $ Insertion cId cAuthor cDate runs
 elemToParPart ns element
-  | isElem ns "w" "del" element
+  | isElem ns "w" "del" element || isElem ns "w" "moveFrom" element
   , Just cId <- findAttr (elemName ns "w" "id") element
   , Just cAuthor <- findAttr (elemName ns "w" "author") element
   , Just cDate <- findAttr (elemName ns "w" "date") element = do
@@ -657,9 +716,10 @@ elemToParPart ns element
 elemToParPart ns element
   | isElem ns "w" "hyperlink" element
   , Just relId <- findAttr (elemName ns "r" "id") element = do
+    location <- asks envLocation
     runs <- mapD (elemToRun ns) (elChildren element)
     rels <- asks envRelationships
-    case lookupRelationship relId rels of
+    case lookupRelationship location relId rels of
       Just target -> do
          case findAttr (elemName ns "w" "anchor") element of
              Just anchor -> return $ ExternalHyperLink (target ++ '#':anchor) runs
@@ -671,9 +731,30 @@ elemToParPart ns element
     runs <- mapD (elemToRun ns) (elChildren element)
     return $ InternalHyperLink anchor runs
 elemToParPart ns element
+  | isElem ns "w" "commentRangeStart" element
+  , Just cmtId <- findAttr (elemName ns "w" "id") element = do
+      (Comments _ commentMap) <- asks envComments
+      case M.lookup cmtId commentMap of
+        Just cmtElem -> elemToCommentStart ns cmtElem
+        Nothing   -> throwError WrongElem
+elemToParPart ns element
+  | isElem ns "w" "commentRangeEnd" element
+  , Just cmtId <- findAttr (elemName ns "w" "id") element =
+    return $ CommentEnd cmtId
+elemToParPart ns element
   | isElem ns "m" "oMath" element =
     (eitherToD $ readOMML $ showElement element) >>= (return . PlainOMath)
 elemToParPart _ _ = throwError WrongElem
+
+elemToCommentStart :: NameSpaces -> Element -> D ParPart
+elemToCommentStart ns element
+  | isElem ns "w" "comment" element
+  , Just cmtId <- findAttr (elemName ns "w" "id") element
+  , Just cmtAuthor <- findAttr (elemName ns "w" "author") element
+  , Just cmtDate <- findAttr (elemName ns "w" "date") element = do
+      bps <- mapD (elemToBodyPart ns) (elChildren element)
+      return $ CommentStart cmtId cmtAuthor cmtDate bps
+elemToCommentStart _ _ = throwError WrongElem
 
 lookupFootnote :: String -> Notes -> Maybe Element
 lookupFootnote s (Notes _ fns _) = fns >>= (M.lookup s)
@@ -681,36 +762,76 @@ lookupFootnote s (Notes _ fns _) = fns >>= (M.lookup s)
 lookupEndnote :: String -> Notes -> Maybe Element
 lookupEndnote s (Notes _ _ ens) = ens >>= (M.lookup s)
 
-elemToRun :: NameSpaces -> Element -> D Run
-elemToRun ns element
-  | isElem ns "w" "r" element
-  , Just drawingElem <- findChild (elemName ns "w" "drawing") element =
-    let a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
-        drawing = findElement (QName "blip" (Just a_ns) (Just "a")) drawingElem
+elemToExtent :: Element -> Extent
+elemToExtent drawingElem =
+  case (getDim "cx", getDim "cy") of
+    (Just w, Just h) -> Just (w, h)
+    _ -> Nothing
+    where
+      wp_ns  = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+      getDim at = findElement (QName "extent" (Just wp_ns) (Just "wp")) drawingElem
+                    >>= findAttr (QName at Nothing Nothing) >>= safeRead
+
+
+childElemToRun :: NameSpaces -> Element -> D Run
+childElemToRun ns element
+  | isElem ns "w" "drawing" element
+  , pic_ns <- "http://schemas.openxmlformats.org/drawingml/2006/picture"
+  , Just picElem <- findElement (QName "pic" (Just pic_ns) (Just "pic")) element
+  = let (title, alt) = getTitleAndAlt ns element
+        a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        drawing = findElement (QName "blip" (Just a_ns) (Just "a")) picElem
                   >>= findAttr (QName "embed" (lookup "r" ns) (Just "r"))
     in
      case drawing of
        Just s -> expandDrawingId s >>=
-                 (\(fp, bs) -> return $ InlineDrawing fp bs)
+                 (\(fp, bs) -> return $ InlineDrawing fp title alt bs $ elemToExtent element)
        Nothing -> throwError WrongElem
-elemToRun ns element
-  | isElem ns "w" "r" element
-  , Just ref <- findChild (elemName ns "w" "footnoteReference") element
-  , Just fnId <- findAttr (elemName ns "w" "id") ref = do
+childElemToRun ns element
+  | isElem ns "w" "drawing" element
+  , c_ns <- "http://schemas.openxmlformats.org/drawingml/2006/chart"
+  , Just _ <- findElement (QName "chart" (Just c_ns) (Just "c")) element
+  = return InlineChart
+childElemToRun ns element
+  | isElem ns "w" "footnoteReference" element
+  , Just fnId <- findAttr (elemName ns "w" "id") element = do
     notes <- asks envNotes
     case lookupFootnote fnId notes of
-      Just e -> do bps <- mapD (elemToBodyPart ns) (elChildren e)
+      Just e -> do bps <- local (\r -> r {envLocation=InFootnote}) $ mapD (elemToBodyPart ns) (elChildren e)
                    return $ Footnote bps
       Nothing  -> return $ Footnote []
-elemToRun ns element
-  | isElem ns "w" "r" element
-  , Just ref <- findChild (elemName ns "w" "endnoteReference") element
-  , Just enId <- findAttr (elemName ns "w" "id") ref = do
+childElemToRun ns element
+  | isElem ns "w" "endnoteReference" element
+  , Just enId <- findAttr (elemName ns "w" "id") element = do
     notes <- asks envNotes
     case lookupEndnote enId notes of
-      Just e -> do bps <- mapD (elemToBodyPart ns) (elChildren e)
+      Just e -> do bps <- local (\r -> r {envLocation=InEndnote}) $ mapD (elemToBodyPart ns) (elChildren e)
                    return $ Endnote bps
       Nothing  -> return $ Endnote []
+childElemToRun _ _ = throwError WrongElem
+
+elemToRun :: NameSpaces -> Element -> D Run
+elemToRun ns element
+  | isElem ns "w" "r" element
+  , Just altCont <- findChild (elemName ns "mc" "AlternateContent") element =
+    do let choices = findChildren (elemName ns "mc" "Choice") altCont
+           choiceChildren = map head $ filter (not . null) $ map elChildren choices
+       outputs <- mapD (childElemToRun ns) choiceChildren
+       case outputs of
+         r : _ -> return r
+         []    -> throwError WrongElem
+elemToRun ns element
+  | isElem ns "w" "r" element
+  , Just drawingElem <- findChild (elemName ns "w" "drawing") element =
+    childElemToRun ns drawingElem
+elemToRun ns element
+  | isElem ns "w" "r" element
+  , Just ref <- findChild (elemName ns "w" "footnoteReference") element =
+    childElemToRun ns ref
+elemToRun ns element
+  | isElem ns "w" "r" element
+  , Just ref <- findChild (elemName ns "w" "endnoteReference") element =
+    childElemToRun ns ref
 elemToRun ns element
   | isElem ns "w" "r" element = do
     runElems <- elemToRunElems ns element
@@ -877,6 +998,8 @@ elemToRunElem ns element
                   map (\x -> fromMaybe x . getUnicode f . lowerFromPrivate $ x) str
   | isElem ns "w" "br" element = return LnBrk
   | isElem ns "w" "tab" element = return Tab
+  | isElem ns "w" "softHyphen" element = return SoftHyphen
+  | isElem ns "w" "noBreakHyphen" element = return NoBreakHyphen
   | isElem ns "w" "sym" element = return (getSymChar ns element)
   | otherwise = throwError WrongElem
   where
@@ -898,10 +1021,6 @@ getSymChar ns element
     lowerFromPrivate xs = xs
 getSymChar _ _ = TextRun ""
 
-stringToFont :: String -> Maybe Font
-stringToFont "Symbol" = Just Symbol
-stringToFont _ = Nothing
-
 elemToRunElems :: NameSpaces -> Element -> D [RunElem]
 elemToRunElems ns element
   |  isElem ns "w" "r" element
@@ -917,3 +1036,4 @@ elemToRunElems _ _ = throwError WrongElem
 
 setFont :: Maybe Font -> ReaderEnv -> ReaderEnv
 setFont f s = s{envFont = f}
+

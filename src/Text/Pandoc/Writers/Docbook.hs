@@ -39,10 +39,10 @@ import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Readers.TeXMath
 import Data.List ( stripPrefix, isPrefixOf, intercalate, isSuffixOf )
 import Data.Char ( toLower )
-import Control.Applicative ((<$>))
 import Data.Monoid ( Any(..) )
 import Text.Pandoc.Highlighting ( languages, languagesByExtension )
 import Text.Pandoc.Pretty
+import Text.Pandoc.ImageSize
 import qualified Text.Pandoc.Builder as B
 import Text.TeXMath
 import qualified Text.XML.Light as Xml
@@ -52,7 +52,7 @@ import Data.Generics (everywhere, mkT)
 authorToDocbook :: WriterOptions -> [Inline] -> B.Inlines
 authorToDocbook opts name' =
   let name = render Nothing $ inlinesToDocbook opts name'
-      colwidth = if writerWrapText opts
+      colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
   in  B.rawInline "docbook" $ render colwidth $
@@ -76,15 +76,21 @@ authorToDocbook opts name' =
 writeDocbook :: WriterOptions -> Pandoc -> String
 writeDocbook opts (Pandoc meta blocks) =
   let elements = hierarchicalize blocks
-      colwidth = if writerWrapText opts
+      colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
-      render' = render colwidth
-      opts' = if "/book>" `isSuffixOf`
-                      (trimr $ writerTemplate opts)
-                 then opts{ writerChapters = True }
-                 else opts
-      startLvl = if writerChapters opts' then 0 else 1
+      render'  = render colwidth
+      opts'    = if (maybe False (("/book>" `isSuffixOf`) . trimr)
+                            (writerTemplate opts) &&
+                     TopLevelDefault == writerTopLevelDivision opts)
+                    then opts{ writerTopLevelDivision = TopLevelChapter }
+                    else opts
+      -- The numbering here follows LaTeX's internal numbering
+      startLvl = case writerTopLevelDivision opts' of
+                   TopLevelPart    -> -1
+                   TopLevelChapter -> 0
+                   TopLevelSection -> 1
+                   TopLevelDefault -> 1
       auths'   = map (authorToDocbook opts) $ docAuthors meta
       meta'    = B.setMeta "author" auths' meta
       Just metadata = metaToJSON opts
@@ -98,9 +104,9 @@ writeDocbook opts (Pandoc meta blocks) =
                                         MathML _ -> True
                                         _        -> False)
               $ metadata
-  in  if writerStandalone opts
-         then renderTemplate' (writerTemplate opts) context
-         else main
+  in  case writerTemplate opts of
+           Nothing   -> main
+           Just tpl  -> renderTemplate' tpl context
 
 -- | Convert an Element to Docbook.
 elementToDocbook :: WriterOptions -> Int -> Element -> Doc
@@ -111,11 +117,20 @@ elementToDocbook opts lvl (Sec _ _num (id',_,_) title elements) =
                     then [Blk (Para [])]
                     else elements
       tag = case lvl of
-                 n | n == 0           -> "chapter"
-                   | n >= 1 && n <= 5 -> "sect" ++ show n
-                   | otherwise        -> "simplesect"
-  in  inTags True tag [("id", writerIdentifierPrefix opts ++ id') |
-                       not (null id')] $
+                 -1                   -> "part"
+                 0                    -> "chapter"
+                 n | n >= 1 && n <= 5 -> if writerDocbook5 opts
+                                              then "section"
+                                              else "sect" ++ show n
+                 _                    -> "simplesect"
+      idName = if writerDocbook5 opts
+                 then "xml:id"
+                 else "id"
+      idAttr = [(idName, writerIdentifierPrefix opts ++ id') | not (null id')]
+      nsAttr = if writerDocbook5 opts && lvl == 0 then [("xmlns", "http://docbook.org/ns/docbook"),("xmlns:xlink", "http://www.w3.org/1999/xlink")]
+                                      else []
+      attribs = nsAttr ++ idAttr
+  in  inTags True tag attribs $
       inTagsSimple "title" (inlinesToDocbook opts title) $$
       vcat (map (elementToDocbook opts (lvl + 1)) elements')
 
@@ -151,14 +166,35 @@ listItemToDocbook :: WriterOptions -> [Block] -> Doc
 listItemToDocbook opts item =
   inTagsIndented "listitem" $ blocksToDocbook opts $ map plainToPara item
 
+imageToDocbook :: WriterOptions -> Attr -> String -> Doc
+imageToDocbook _ attr src = selfClosingTag "imagedata" $
+  ("fileref", src) : idAndRole attr ++ dims
+  where
+    dims = go Width "width" ++ go Height "depth"
+    go dir dstr = case (dimension dir attr) of
+                    Just a  -> [(dstr, show a)]
+                    Nothing -> []
+
 -- | Convert a Pandoc block element to Docbook.
 blockToDocbook :: WriterOptions -> Block -> Doc
 blockToDocbook _ Null = empty
-blockToDocbook opts (Div _ bs) = blocksToDocbook opts $ map plainToPara bs
+-- Add ids to paragraphs in divs with ids - this is needed for
+-- pandoc-citeproc to get link anchors in bibliographies:
+blockToDocbook opts (Div (ident,_,_) [Para lst]) =
+  let attribs = [("id", ident) | not (null ident)] in
+  if hasLineBreaks lst
+     then flush $ nowrap $ inTags False "literallayout" attribs
+                         $ inlinesToDocbook opts lst
+     else inTags True "para" attribs $ inlinesToDocbook opts lst
+blockToDocbook opts (Div (ident,_,_) bs) =
+  (if null ident
+      then mempty
+      else selfClosingTag "anchor" [("id", ident)]) $$
+  blocksToDocbook opts (map plainToPara bs)
 blockToDocbook _ (Header _ _ _) = empty -- should not occur after hierarchicalize
 blockToDocbook opts (Plain lst) = inlinesToDocbook opts lst
 -- title beginning with fig: indicates that the image is a figure
-blockToDocbook opts (Para [Image txt (src,'f':'i':'g':':':_)]) =
+blockToDocbook opts (Para [Image attr txt (src,'f':'i':'g':':':_)]) =
   let alt  = inlinesToDocbook opts txt
       capt = if null txt
                 then empty
@@ -167,11 +203,13 @@ blockToDocbook opts (Para [Image txt (src,'f':'i':'g':':':_)]) =
         capt $$
         (inTagsIndented "mediaobject" $
            (inTagsIndented "imageobject"
-             (selfClosingTag "imagedata" [("fileref",src)])) $$
+             (imageToDocbook opts attr src)) $$
            inTagsSimple "textobject" (inTagsSimple "phrase" alt))
 blockToDocbook opts (Para lst)
   | hasLineBreaks lst = flush $ nowrap $ inTagsSimple "literallayout" $ inlinesToDocbook opts lst
   | otherwise         = inTagsIndented "para" $ inlinesToDocbook opts lst
+blockToDocbook opts (LineBlock lns) =
+  blockToDocbook opts $ linesToPara lns
 blockToDocbook opts (BlockQuote blocks) =
   inTagsIndented "blockquote" $ blocksToDocbook opts blocks
 blockToDocbook _ (CodeBlock (_,classes,_) str) =
@@ -210,9 +248,11 @@ blockToDocbook opts (OrderedList (start, numstyle, _) (first:rest)) =
 blockToDocbook opts (DefinitionList lst) =
   let attribs = [("spacing", "compact") | isTightList $ concatMap snd lst]
   in  inTags True "variablelist" attribs $ deflistItemsToDocbook opts lst
-blockToDocbook _ (RawBlock f str)
+blockToDocbook opts (RawBlock f str)
   | f == "docbook" = text str -- raw XML block
-  | f == "html"    = text str -- allow html for backwards compatibility
+  | f == "html"    = if writerDocbook5 opts
+                        then empty -- No html in Docbook5
+                        else text str -- allow html for backwards compatibility
   | otherwise      = empty
 blockToDocbook _ HorizontalRule = empty -- not semantic
 blockToDocbook opts (Table caption aligns widths headers rows) =
@@ -289,7 +329,10 @@ inlineToDocbook opts (Quoted _ lst) =
   inTagsSimple "quote" $ inlinesToDocbook opts lst
 inlineToDocbook opts (Cite _ lst) =
   inlinesToDocbook opts lst
-inlineToDocbook opts (Span _ ils) =
+inlineToDocbook opts (Span (ident,_,_) ils) =
+  (if null ident
+      then mempty
+      else selfClosingTag "anchor" [("id", ident)]) <>
   inlinesToDocbook opts ils
 inlineToDocbook _ (Code _ str) =
   inTagsSimple "literal" $ text (escapeStringForXML str)
@@ -314,7 +357,9 @@ inlineToDocbook _ (RawInline f x) | f == "html" || f == "docbook" = text x
                                   | otherwise                     = empty
 inlineToDocbook _ LineBreak = text "\n"
 inlineToDocbook _ Space = space
-inlineToDocbook opts (Link txt (src, _))
+-- because we use \n for LineBreak, we can't do soft breaks:
+inlineToDocbook _ SoftBreak = space
+inlineToDocbook opts (Link attr txt (src, _))
   | Just email <- stripPrefix "mailto:" src =
       let emailLink = inTagsSimple "email" $ text $
                       escapeStringForXML $ email
@@ -324,19 +369,31 @@ inlineToDocbook opts (Link txt (src, _))
                               char '(' <> emailLink <> char ')'
   | otherwise =
       (if isPrefixOf "#" src
-            then inTags False "link" [("linkend", drop 1 src)]
-            else inTags False "ulink" [("url", src)]) $
+            then inTags False "link" $ ("linkend", drop 1 src) : idAndRole attr
+            else if writerDocbook5 opts
+                    then inTags False "link" $ ("xlink:href", src) : idAndRole attr
+                    else inTags False "ulink" $ ("url", src) : idAndRole attr ) $
         inlinesToDocbook opts txt
-inlineToDocbook _ (Image _ (src, tit)) =
+inlineToDocbook opts (Image attr _ (src, tit)) =
   let titleDoc = if null tit
                    then empty
                    else inTagsIndented "objectinfo" $
                         inTagsIndented "title" (text $ escapeStringForXML tit)
   in  inTagsIndented "inlinemediaobject" $ inTagsIndented "imageobject" $
-      titleDoc $$ selfClosingTag "imagedata" [("fileref", src)]
+      titleDoc $$ imageToDocbook opts attr src
 inlineToDocbook opts (Note contents) =
   inTagsIndented "footnote" $ blocksToDocbook opts contents
 
 isMathML :: HTMLMathMethod -> Bool
 isMathML (MathML _) = True
 isMathML _          = False
+
+idAndRole :: Attr -> [(String, String)]
+idAndRole (id',cls,_) = ident ++ role
+  where
+    ident = if null id'
+               then []
+               else [("id", id')]
+    role  = if null cls
+               then []
+               else [("role", unwords cls)]

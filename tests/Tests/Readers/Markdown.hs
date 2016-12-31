@@ -4,12 +4,10 @@ module Tests.Readers.Markdown (tests) where
 import Text.Pandoc.Definition
 import Test.Framework
 import Tests.Helpers
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 import Text.Pandoc.Builder
 import qualified Data.Set as Set
--- import Text.Pandoc.Shared ( normalize )
 import Text.Pandoc
-import Text.Pandoc.Error
 
 markdown :: String -> Pandoc
 markdown = handleError . readMarkdown def
@@ -36,7 +34,10 @@ testBareLink (inp, ils) =
        inp (inp, doc $ para ils)
 
 autolink :: String -> Inlines
-autolink s = link s "" (str s)
+autolink = autolinkWith nullAttr
+
+autolinkWith :: Attr -> String -> Inlines
+autolinkWith attr s = linkWith attr s "" (str s)
 
 bareLinkTests :: [(String, Inlines)]
 bareLinkTests =
@@ -66,9 +67,11 @@ bareLinkTests =
   , ("http://en.wikipedia.org/wiki/Sprite_(computer_graphics)",
       autolink "http://en.wikipedia.org/wiki/Sprite_(computer_graphics)")
   , ("http://en.wikipedia.org/wiki/Sprite_[computer_graphics]",
-      autolink "http://en.wikipedia.org/wiki/Sprite_[computer_graphics]")
+      link "http://en.wikipedia.org/wiki/Sprite_%5Bcomputer_graphics%5D" ""
+        (str "http://en.wikipedia.org/wiki/Sprite_[computer_graphics]"))
   , ("http://en.wikipedia.org/wiki/Sprite_{computer_graphics}",
-      autolink "http://en.wikipedia.org/wiki/Sprite_{computer_graphics}")
+      link "http://en.wikipedia.org/wiki/Sprite_%7Bcomputer_graphics%7D" ""
+        (str "http://en.wikipedia.org/wiki/Sprite_{computer_graphics}"))
   , ("http://example.com/Notification_Center-GitHub-20101108-140050.jpg",
       autolink "http://example.com/Notification_Center-GitHub-20101108-140050.jpg")
   , ("https://github.com/github/hubot/blob/master/scripts/cream.js#L20-20",
@@ -119,6 +122,10 @@ bareLinkTests =
       autolink "http://business.timesonline.co.uk/article/0,,9065-2473189,00.html")
   , ("http://www.mail-archive.com/ruby-talk@ruby-lang.org/",
       autolink "http://www.mail-archive.com/ruby-talk@ruby-lang.org/")
+  , ("https://example.org/?anchor=lala-",
+      autolink "https://example.org/?anchor=lala-")
+  , ("https://example.org/?anchor=-lala",
+      autolink "https://example.org/?anchor=-lala")
   ]
 
 {-
@@ -142,7 +149,8 @@ tests = [ testGroup "inline code"
                 (codeWith ("",["javascript"],[]) "document.write(\"Hello\");")
           , "with attribute space" =:
             "`*` {.haskell .special x=\"7\"}"
-            =?> para (codeWith ("",["haskell","special"],[("x","7")]) "*")
+            =?> para (code "*" <> space <> str "{.haskell" <> space <>
+                      str ".special" <> space <> str "x=\"7\"}")
           ]
         , testGroup "emph and strong"
           [ "two strongs in emph" =:
@@ -151,7 +159,7 @@ tests = [ testGroup "inline code"
           , "emph and strong emph alternating" =:
             "*xxx* ***xxx*** xxx\n*xxx* ***xxx*** xxx"
             =?> para (emph "xxx" <> space <> strong (emph "xxx") <>
-                      space <> "xxx" <> space <>
+                      space <> "xxx" <> softbreak <>
                       emph "xxx" <> space <> strong (emph "xxx") <>
                       space <> "xxx")
           , "emph with spaced strong" =:
@@ -172,6 +180,21 @@ tests = [ testGroup "inline code"
           , "invalid tag (issue #1820" =:
             "</ div></.div>" =?>
             para (text "</ div></.div>")
+          , "technically invalid comment" =:
+            "<!-- pandoc --help -->" =?>
+            rawBlock "html" "<!-- pandoc --help -->"
+          , test markdownGH "issue 2469" $
+            "<\n\na>" =?>
+            para (text "<") <> para (text "a>")
+          ]
+        , testGroup "raw email addresses"
+          [ test markdownGH "issue 2940" $
+            "**@user**" =?>
+            para (strong (text "@user"))
+          ]
+        , testGroup "emoji"
+          [ test markdownGH "emoji symbols" $
+            ":smile: and :+1:" =?> para (text "😄 and 👍")
           ]
         , "unbalanced brackets" =:
             "[[[[[[[[[[[[[[[hi" =?> para (text "[[[[[[[[[[[[[[[hi")
@@ -190,11 +213,31 @@ tests = [ testGroup "inline code"
             =?> para (link "/there.0" "" "hi")
           ]
         , testGroup "bare URIs"
-          (map testBareLink bareLinkTests)
+             (map testBareLink bareLinkTests)
         , testGroup "autolinks"
           [ "with unicode dash following" =:
             "<http://foo.bar>\8212" =?> para (autolink "http://foo.bar" <>
                                          str "\8212")
+          , "a partial URL (#2277)" =:
+            "<www.boe.es/buscar/act.php?id=BOE-A-1996-8930#a66>" =?>
+            para (text "<www.boe.es/buscar/act.php?id=BOE-A-1996-8930#a66>")
+          , "with some attributes" =:
+            "<http://foo.bar>{#i .j .z k=v}" =?>
+            para (autolinkWith ("i", ["j", "z"], [("k", "v")]) "http://foo.bar")
+          , "with some attributes and spaces" =:
+            "<http://foo.bar> {#i .j .z k=v}" =?>
+            para (autolink "http://foo.bar" <> space <> text "{#i .j .z k=v}")
+          ]
+        , testGroup "links"
+          [ "no autolink inside link" =:
+            "[<https://example.org>](url)" =?>
+            para (link "url" "" (text "<https://example.org>"))
+          , "no inline link inside link" =:
+            "[[a](url2)](url)" =?>
+            para (link "url" "" (text "[a](url2)"))
+          , "no bare URI inside link" =:
+            "[https://example.org(](url)" =?>
+            para (link "url" "" (text "https://example.org("))
           ]
         , testGroup "Headers"
           [ "blank line before header" =:
@@ -203,6 +246,36 @@ tests = [ testGroup "inline code"
           , "bracketed text (#2062)" =:
             "# [hi]\n"
             =?> headerWith ("hi",[],[]) 1 "[hi]"
+          , "ATX header without trailing #s" =:
+            "# Foo bar\n\n" =?>
+            headerWith ("foo-bar",[],[]) 1 "Foo bar"
+          , "ATX header without trailing #s" =:
+            "# Foo bar with # #" =?>
+            headerWith ("foo-bar-with",[],[]) 1 "Foo bar with #"
+          , "setext header" =:
+            "Foo bar\n=\n\n Foo bar 2 \n=" =?>
+            headerWith ("foo-bar",[],[]) 1 "Foo bar"
+            <> headerWith ("foo-bar-2",[],[]) 1 "Foo bar 2"
+          ]
+        , testGroup "Implicit header references"
+          [ "ATX header without trailing #s" =:
+            "# Header\n[header]\n\n[header ]\n\n[ header]" =?>
+            headerWith ("header",[],[]) 1 "Header"
+            <> para (link "#header" "" (text "header"))
+            <> para (link "#header" "" (text "header"))
+            <> para (link "#header" "" (text "header"))
+          , "ATX header with trailing #s" =:
+            "# Foo bar #\n[foo bar]\n\n[foo bar ]\n\n[ foo bar]" =?>
+            headerWith ("foo-bar",[],[]) 1 "Foo bar"
+            <> para (link "#foo-bar" "" (text "foo bar"))
+            <> para (link "#foo-bar" "" (text "foo bar"))
+            <> para (link "#foo-bar" "" (text "foo bar"))
+          , "setext header" =:
+            " Header \n=\n\n[header]\n\n[header ]\n\n[ header]" =?>
+            headerWith ("header",[],[]) 1 "Header"
+            <> para (link "#header" "" (text "header"))
+            <> para (link "#header" "" (text "header"))
+            <> para (link "#header" "" (text "header"))
           ]
         , testGroup "smart punctuation"
           [ test markdownSmart "quote before ellipses"
@@ -265,7 +338,8 @@ tests = [ testGroup "inline code"
                            ]
           , "laziness" =:
             "foo1\n  :  bar\nbaz\n  : bar2\n" =?>
-            definitionList [ (text "foo1", [plain (text "bar baz"),
+            definitionList [ (text "foo1", [plain (text "bar" <>
+                                                 softbreak <> text "baz"),
                                             plain (text "bar2")])
                            ]
           , "no blank space before first of two paragraphs" =:
@@ -287,7 +361,8 @@ tests = [ testGroup "inline code"
         , testGroup "+compact_definition_lists"
           [ test markdownCDL "basic compact list" $
             "foo1\n:   bar\n    baz\nfoo2\n:   bar2\n" =?>
-            definitionList [ (text "foo1", [plain (text "bar baz")])
+            definitionList [ (text "foo1", [plain (text "bar" <> softbreak <>
+                                                     text "baz")])
                            , (text "foo2", [plain (text "bar2")])
                            ]
           ]
@@ -308,6 +383,15 @@ tests = [ testGroup "inline code"
               bulletList [ plain "a"
                          , plain "b"
                          , plain "c" <> bulletList [plain "d"] ]
+          ]
+        , testGroup "entities"
+          [ "character references" =:
+            "&lang; &ouml;" =?> para (text "\10216 ö")
+          , "numeric" =:
+            "&#44;&#x44;&#X44;" =?> para (text ",DD")
+          , "in link title" =:
+            "[link](/url \"title &lang; &ouml; &#44;\")" =?>
+               para (link "/url" "title \10216 ö ," (text "link"))
           ]
         , testGroup "citations"
           [ "simple" =:

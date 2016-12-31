@@ -5,10 +5,13 @@ import Test.Framework
 import Text.Pandoc.Builder
 import Text.Pandoc
 import Tests.Helpers
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 
-docbook :: (ToString a, ToPandoc a) => a -> String
-docbook = writeDocbook def{ writerWrapText = False } . toPandoc
+docbook :: (ToPandoc a) => a -> String
+docbook = docbookWithOpts def{ writerWrapText = WrapNone }
+
+docbookWithOpts :: ToPandoc a => WriterOptions -> a -> String
+docbookWithOpts opts = writeDocbook opts . toPandoc
 
 {-
   "my test" =: X =?> Y
@@ -224,6 +227,76 @@ tests = [ testGroup "line blocks"
                                       , "  </varlistentry>"
                                       , "</variablelist>"
                                       ]
+            ]
+          ]
+        , testGroup "writer options" $
+          [ testGroup "top-level division" $
+            let
+              headers =  header 1 (text "header1")
+                      <> header 2 (text "header2")
+                      <> header 3 (text "header3")
+
+              docbookTopLevelDiv :: (ToPandoc a)
+                                 => TopLevelDivision -> a -> String
+              docbookTopLevelDiv division =
+                docbookWithOpts def{ writerTopLevelDivision = division }
+            in
+            [ test (docbookTopLevelDiv TopLevelSection) "sections as top-level" $
+              headers =?>
+              unlines [ "<sect1>"
+                      , "  <title>header1</title>"
+                      , "  <sect2>"
+                      , "    <title>header2</title>"
+                      , "    <sect3>"
+                      , "      <title>header3</title>"
+                      , "      <para>"
+                      , "      </para>"
+                      , "    </sect3>"
+                      , "  </sect2>"
+                      , "</sect1>"
+                      ]
+            , test (docbookTopLevelDiv TopLevelChapter) "chapters as top-level" $
+              headers =?>
+              unlines [ "<chapter>"
+                      , "  <title>header1</title>"
+                      , "  <sect1>"
+                      , "    <title>header2</title>"
+                      , "    <sect2>"
+                      , "      <title>header3</title>"
+                      , "      <para>"
+                      , "      </para>"
+                      , "    </sect2>"
+                      , "  </sect1>"
+                      , "</chapter>"
+                      ]
+            , test (docbookTopLevelDiv TopLevelPart) "parts as top-level" $
+              headers =?>
+              unlines [ "<part>"
+                      , "  <title>header1</title>"
+                      , "  <chapter>"
+                      , "    <title>header2</title>"
+                      , "    <sect1>"
+                      , "      <title>header3</title>"
+                      , "      <para>"
+                      , "      </para>"
+                      , "    </sect1>"
+                      , "  </chapter>"
+                      , "</part>"
+                      ]
+            , test (docbookTopLevelDiv TopLevelDefault) "default top-level" $
+              headers =?>
+              unlines [ "<sect1>"
+                      , "  <title>header1</title>"
+                      , "  <sect2>"
+                      , "    <title>header2</title>"
+                      , "    <sect3>"
+                      , "      <title>header3</title>"
+                      , "      <para>"
+                      , "      </para>"
+                      , "    </sect3>"
+                      , "  </sect2>"
+                      , "</sect1>"
+                      ]
             ]
           ]
         ]

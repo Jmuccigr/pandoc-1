@@ -1,31 +1,38 @@
-\startmode[*mkii]
-  \enableregime[utf-8]  
-  \setupcolors[state=start]
-\stopmode
-
 % Enable hyperlinks
-\setupinteraction[state=start, color=middleblue]
+\setupinteraction
+  [state=start,
+  title={Pandoc Test Suite},
+  author={John MacFarlane; Anonymous},
+  style=,
+  color=,
+  contrastcolor=]
+% make chapter, section bookmarks visible when opening document
+\placebookmarks[chapter, section, subsection, subsubsection, subsubsubsection, subsubsubsubsection][chapter, section]
+\setupinteractionscreen[option=bookmark]
+\setuptagging[state=start]
 
-\setuppapersize [letter][letter]
-\setuplayout    [width=middle,  backspace=1.5in, cutspace=1.5in,
-                 height=middle, topspace=0.75in, bottomspace=0.75in]
-
-\setuppagenumbering[location={footer,center}]
-
-\setupbodyfont[11pt]
-
+% use microtypography
+\definefontfeature[default][default][script=latn, protrusion=quality, expansion=quality, itlc=yes, textitalics=yes, onum=yes, pnum=yes]
+\definefontfeature[smallcaps][script=latn, protrusion=quality, expansion=quality, smcp=yes, onum=yes, pnum=yes]
+\setupalign[hz,hanging]
+\setupitaliccorrection[global, always]
+\setupbodyfontenvironment[default][em=italic] % use italic as em, not slanted
+\usemodule[simplefonts]
+\setmainfontfallback[DejaVu Serif][range={greekandcoptic, greekextended}, force=yes, rscale=auto]
 \setupwhitespace[medium]
 
-\setuphead[chapter]      [style=\tfd]
-\setuphead[section]      [style=\tfc]
-\setuphead[subsection]   [style=\tfb]
-\setuphead[subsubsection][style=\bf]
+\setuphead[chapter]            [style=\tfd,header=empty]
+\setuphead[section]            [style=\tfc]
+\setuphead[subsection]         [style=\tfb]
+\setuphead[subsubsection]      [style=\bf]
+\setuphead[subsubsubsection]   [style=\sc]
+\setuphead[subsubsubsubsection][style=\it]
 
-\setuphead[chapter, section, subsection, subsubsection][number=no]
+\setuphead[chapter, section, subsection, subsubsection, subsubsubsection, subsubsubsubsection][number=no]
 
 \definedescription
   [description]
-  [headstyle=bold, style=normal, location=hanging, width=broad, margin=1cm]
+  [headstyle=bold, style=normal, location=hanging, width=broad, margin=1cm, alternative=hanging]
 
 \setupitemize[autointro]    % prevent orphan list intro
 \setupitemize[indentnext=no]
@@ -35,23 +42,15 @@
 
 \setupthinrules[width=15em] % width of horizontal rules
 
-\setupdelimitedtext
-  [blockquote]
-  [before={\blank[medium]},
-   after={\blank[medium]},
-   indentnext=no,
-  ]
-
 
 \starttext
-\startalignment[center]
-  \blank[2*big]
+\startalignment[middle]
   {\tfd Pandoc Test Suite}
-  \blank[3*medium]
+  \smallskip
   {\tfa John MacFarlane\crlf Anonymous}
-  \blank[2*medium]
+  \smallskip
   {\tfa July 17, 2006}
-  \blank[3*medium]
+  \bigskip
 \stopalignment
 
 This is a set of tests for pandoc. Most of them are adapted from John Gruber's
@@ -545,11 +544,13 @@ Blank line after term, indented marker, alternate markers:
 Simple block on one line:
 
 foo
+
 And nested without indentation:
 
 foo
 
 bar
+
 Interpreted markdown in a table:
 
 This is {\em emphasized}
@@ -575,6 +576,7 @@ As should this:
 Now, nested:
 
 foo
+
 This should just be an HTML comment:
 
 Multiline:

@@ -33,17 +33,15 @@ module Text.Pandoc.Readers.Txt2Tags ( readTxt2Tags
                                     where
 
 import qualified Text.Pandoc.Builder as B
-import Text.Pandoc.Builder ( Inlines, Blocks, (<>)
-                           , trimInlines )
+import Text.Pandoc.Builder ( Inlines, Blocks, trimInlines )
+import Data.Monoid ((<>))
 import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.Shared (escapeURI,compactify', compactify'DL)
 import Text.Pandoc.Parsing hiding (space, spaces, uri, macro)
-import Control.Applicative ((<$>), (<$), (<*>), (<*), (*>))
 import Data.Char (toLower)
 import Data.List (transpose, intersperse, intercalate)
 import Data.Maybe (fromMaybe)
-import Data.Monoid (Monoid, mconcat, mempty, mappend)
 --import Network.URI (isURI) -- Not sure whether to use this function
 import Control.Monad (void, guard, when)
 import Data.Default
@@ -51,9 +49,9 @@ import Control.Monad.Reader (Reader, runReader, asks)
 import Text.Pandoc.Error
 
 import Data.Time.LocalTime (getZonedTime)
-import Text.Pandoc.Compat.Directory(getModificationTime)
+import System.Directory(getModificationTime)
 import Data.Time.Format (formatTime)
-import Text.Pandoc.Compat.Locale (defaultTimeLocale)
+import Text.Pandoc.Compat.Time (defaultTimeLocale)
 import System.IO.Error (catchIOError)
 
 type T2T = ParserT String ParserState (Reader T2TMeta)
@@ -287,7 +285,7 @@ table = try $ do
                     (zip aligns (replicate ncolumns 0.0))
                       headerPadded rowsPadded
 
-pad :: (Show a, Monoid a) => Int -> [a] -> [a]
+pad :: (Monoid a) => Int -> [a] -> [a]
 pad n xs = xs ++ (replicate (n - length xs) mempty)
 
 
@@ -552,7 +550,7 @@ endline = try $ do
   notFollowedBy quote
   notFollowedBy list
   notFollowedBy table
-  return $ B.space
+  return $ B.softbreak
 
 str :: T2T Inlines
 str = try $ do

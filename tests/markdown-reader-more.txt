@@ -28,6 +28,14 @@
 \stop[a2]
 \stop[a2]
 
+## Raw LaTeX environments
+
+\begin{center}
+\begin{tikzpicture}[baseline={([yshift=+-.5ex]current bounding box.center)}, level distance=24pt]
+\Tree [.{S} [.NP John\index{i} ] [.VP [.V likes ] [.NP himself\index{i,*j} ]]]
+\end{tikzpicture}
+\end{center}
+
 ## URLs with spaces and punctuation
 
 [foo](/bar and baz)
@@ -168,6 +176,8 @@ A link to [My header].
 
 Another link to [it][My header].
 
+Should be [case insensitive][my header].
+
 Link to [Explicit header attributes].
 
 [my other header]: /foo
@@ -204,6 +214,26 @@ But this is not a link to [My other header], since the reference is defined.
 Headless
 
 +------------------+-----------+------------+
+| r1 a             | b         | c          |
+| r1 bis           | b 2       | c 2        |
++------------------+-----------+------------+
+| r2 d             | e         | f          |
++------------------+-----------+------------+
+
+With alignments
+
++------------------+-----------+------------+
+| col 1            | col 2     | col 3      |
++=================:+:==========+:==========:+
+| r1 a             | b         | c          |
+| r1 bis           | b 2       | c 2        |
++------------------+-----------+------------+
+| r2 d             | e         | f          |
++------------------+-----------+------------+
+
+Headless with alignments
+
++-----------------:+:----------+:----------:+
 | r1 a             | b         | c          |
 | r1 bis           | b 2       | c 2        |
 +------------------+-----------+------------+
@@ -258,6 +288,10 @@ Empty cells
 
 [linky]: hi_(there_(nested))
 
+## Backslashes in link references
+
+[\*\a](b)
+
 ## Reference link fallbacks
 
 [*not a link*] [*nope*]...
@@ -281,3 +315,6 @@ bar
 
 - blah blah blah blah blah blah blah blah blah blah blah blah blah blah 2015.
 
+## Bracketed spans
+
+[*foo* bar baz [link](url)]{.class #id key=val}

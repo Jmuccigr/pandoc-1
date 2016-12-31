@@ -45,9 +45,11 @@ import Text.Pandoc.Options (WriterOptions(..))
 import qualified Data.HashMap.Strict as H
 import qualified Data.Map as M
 import qualified Data.Text as T
-import Data.Aeson (FromJSON(..), fromJSON, ToJSON (..), Value(Object), Result(..))
+import Data.Aeson (FromJSON(..), fromJSON, ToJSON (..), Value(Object), Result(..), encode)
+import Text.Pandoc.UTF8 (toStringLazy)
 import qualified Data.Traversable as Traversable
 import Data.List ( groupBy )
+import Data.Maybe ( isJust )
 
 -- | Create JSON value for template from a 'Meta' and an association list
 -- of variables, specified at the command line or in the writer.
@@ -61,13 +63,14 @@ metaToJSON :: Monad m
            -> Meta
            -> m Value
 metaToJSON opts blockWriter inlineWriter (Meta metamap)
-  | writerStandalone opts = do
+  | isJust (writerTemplate opts) = do
     let baseContext = foldl (\acc (x,y) -> setField x y acc) (Object H.empty)
                       $ writerVariables opts
     renderedMap <- Traversable.mapM
                    (metaValueToJSON blockWriter inlineWriter)
                    metamap
-    return $ M.foldWithKey defField baseContext renderedMap
+    let metadata = M.foldWithKey defField baseContext renderedMap
+    return $ defField "meta-json" (toStringLazy $ encode metadata) metadata
   | otherwise = return (Object H.empty)
 
 metaValueToJSON :: Monad m
@@ -146,6 +149,7 @@ isDisplayMath _                    = False
 stripLeadingTrailingSpace :: [Inline] -> [Inline]
 stripLeadingTrailingSpace = go . reverse . go . reverse
   where go (Space:xs) = xs
+        go (SoftBreak:xs) = xs
         go xs         = xs
 
 -- Put display math in its own block (for ODT/DOCX).

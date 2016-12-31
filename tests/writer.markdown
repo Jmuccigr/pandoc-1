@@ -4,7 +4,7 @@ author:
 - Anonymous
 date: 'July 17, 2006'
 title: Pandoc Test Suite
-...
+---
 
 This is a set of tests for pandoc. Most of them are adapted from John Gruber’s
 markdown test suite.
@@ -210,7 +210,6 @@ Here’s another:
     -   Fee
     -   Fie
     -   Foe
-
 3.  Third
 
 Same thing but with paragraphs:
@@ -549,8 +548,8 @@ LaTeX
 These shouldn’t be math:
 
 -   To get the famous equation, write `$e = mc^2$`.
--   \$22,000 is a *lot* of money. So is \$34,000. (It worked if “lot”
-    is emphasized.)
+-   \$22,000 is a *lot* of money. So is \$34,000. (It worked if “lot” is
+    emphasized.)
 -   Shoes (\$20) and socks (\$5).
 -   Escaped `$`: \$73 *this should be emphasized* 23\$.
 

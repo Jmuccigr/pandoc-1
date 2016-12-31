@@ -1,8 +1,7 @@
 Pandoc Test Suite
 =================
-:author: John MacFarlane
-:author: Anonymous
-:date: July 17, 2006
+John MacFarlane; Anonymous
+July 17, 2006
 
 This is a set of tests for pandoc. Most of them are adapted from John Gruber’s
 markdown test suite.
@@ -81,11 +80,11 @@ ______________________
 --
 Code in a block quote:
 
---------------------
+....
 sub status {
     print "working";
 }
---------------------
+....
 
 A list:
 
@@ -117,7 +116,7 @@ Code Blocks
 
 Code:
 
---------------------------------------
+....
 ---- (should be four hyphens)
 
 sub status {
@@ -125,15 +124,15 @@ sub status {
 }
 
 this code block is indented by one tab
---------------------------------------
+....
 
 And:
 
---------------------------------------------
+....
     this code block is indented by two tabs
 
 These should not be escaped:  \$ \\ \> \[ \{
---------------------------------------------
+....
 
 '''''
 
@@ -326,9 +325,9 @@ _apple_::
 _orange_::
   orange fruit
   +
----------------------
+....
 { orange code block }
----------------------
+....
   +
   __________________
   orange block quote
@@ -394,17 +393,17 @@ foo
 
 This should be a code block, though:
 
--------
+....
 <div>
     foo
 </div>
--------
+....
 
 As should this:
 
---------------
+....
 <div>foo</div>
---------------
+....
 
 Now, nested:
 
@@ -416,17 +415,17 @@ Multiline:
 
 Code block:
 
-----------------
+....
 <!-- Comment -->
-----------------
+....
 
 Just plain comment, with trailing spaces on the line:
 
 Code:
 
-------
+....
 <hr />
-------
+....
 
 Hr’s:
 
@@ -436,11 +435,11 @@ Hr’s:
 Inline Markup
 -------------
 
-This is __emphasized__, and so __is this__.
+This is _emphasized_, and so _is this_.
 
-This is **strong**, and so **is this**.
+This is *strong*, and so *is this*.
 
-An __link:/url[emphasized link]__.
+An _link:/url[emphasized link]_.
 
 *_This is strong and em._*
 
@@ -452,7 +451,7 @@ So is *_this_* word.
 
 This is code: `>`, `$`, `\`, `\$`, `<html>`.
 
-[line-through]*This is __strikeout__.*
+[line-through]*This is _strikeout_.*
 
 Superscripts: a^bc^d a^_hello_^ a^hello there^.
 
@@ -617,9 +616,9 @@ Indented link:/url[thrice].
 
 This should [not][] be a link.
 
------------
+....
 [not]: /url
------------
+....
 
 Foo link:/url/[bar].
 
@@ -655,9 +654,9 @@ ________________________________
 
 Auto-links should not occur here: `<http://example.com/>`
 
-------------------------------
+....
 or here: <http://example.com/>
-------------------------------
+....
 
 '''''
 

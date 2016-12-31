@@ -1,8 +1,7 @@
 *~
 dist/*
-README.*
-!README.Debian
-INSTALL.*
+MANUAL.*
+!MANUAL.txt
 .configure-stamp
 .cabal-sandbox
 cabal.sandbox.config
@@ -22,3 +21,4 @@ man/man?/*.html
 windows/*.wixobj
 data/reference.docx
 data/reference.odt
+.stack-work

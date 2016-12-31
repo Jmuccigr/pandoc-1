@@ -33,7 +33,7 @@ module Text.Pandoc.Writers.CommonMark (writeCommonMark) where
 
 import Text.Pandoc.Writers.HTML (writeHtmlString)
 import Text.Pandoc.Definition
-import Text.Pandoc.Shared (isTightList)
+import Text.Pandoc.Shared (isTightList, linesToPara)
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.Writers.Shared
 import Text.Pandoc.Options
@@ -56,9 +56,9 @@ writeCommonMark opts (Pandoc meta blocks) = rendered
                      (inlinesToCommonMark opts)
                      meta
         context = defField "body" main $ metadata
-        rendered = if writerStandalone opts
-                      then renderTemplate' (writerTemplate opts) context
-                      else main
+        rendered = case writerTemplate opts of
+                        Nothing  -> main
+                        Just tpl -> renderTemplate' tpl context
 
 processNotes :: Inline -> State [[Block]] Inline
 processNotes (Note bs) = do
@@ -75,18 +75,18 @@ blocksToCommonMark opts bs = return $
   T.unpack $ nodeToCommonmark cmarkOpts colwidth
            $ node DOCUMENT (blocksToNodes bs)
    where cmarkOpts = [optHardBreaks | isEnabled Ext_hard_line_breaks opts]
-         colwidth = if writerWrapText opts
-                       then writerColumns opts
-                       else 0
+         colwidth = if writerWrapText opts == WrapAuto
+                       then Just $ writerColumns opts
+                       else Nothing
 
 inlinesToCommonMark :: WriterOptions -> [Inline] -> Identity String
 inlinesToCommonMark opts ils = return $
   T.unpack $ nodeToCommonmark cmarkOpts colwidth
            $ node PARAGRAPH (inlinesToNodes ils)
    where cmarkOpts = [optHardBreaks | isEnabled Ext_hard_line_breaks opts]
-         colwidth = if writerWrapText opts
-                       then writerColumns opts
-                       else 0
+         colwidth = if writerWrapText opts == WrapAuto
+                       then Just $ writerColumns opts
+                       else Nothing
 
 blocksToNodes :: [Block] -> [Node]
 blocksToNodes = foldr blockToNodes []
@@ -94,11 +94,12 @@ blocksToNodes = foldr blockToNodes []
 blockToNodes :: Block -> [Node] -> [Node]
 blockToNodes (Plain xs) = (node PARAGRAPH (inlinesToNodes xs) :)
 blockToNodes (Para xs) = (node PARAGRAPH (inlinesToNodes xs) :)
+blockToNodes (LineBlock lns) = blockToNodes $ linesToPara lns
 blockToNodes (CodeBlock (_,classes,_) xs) =
   (node (CODE_BLOCK (T.pack (unwords classes)) (T.pack xs)) [] :)
 blockToNodes (RawBlock fmt xs)
-  | fmt == Format "html" = (node (HTML (T.pack xs)) [] :)
-  | otherwise = id
+  | fmt == Format "html" = (node (HTML_BLOCK (T.pack xs)) [] :)
+  | otherwise = (node (CUSTOM_BLOCK (T.pack xs) (T.empty)) [] :)
 blockToNodes (BlockQuote bs) =
   (node BLOCK_QUOTE (blocksToNodes bs) :)
 blockToNodes (BulletList items) =
@@ -116,8 +117,8 @@ blockToNodes (OrderedList (start, _sty, delim) items) =
                                 _         -> PERIOD_DELIM,
                listTight = isTightList items,
                listStart = start }) (map (node ITEM . blocksToNodes) items) :)
-blockToNodes HorizontalRule = (node HRULE [] :)
-blockToNodes (Header lev _ ils) = (node (HEADER lev) (inlinesToNodes ils) :)
+blockToNodes HorizontalRule = (node THEMATIC_BREAK [] :)
+blockToNodes (Header lev _ ils) = (node (HEADING lev) (inlinesToNodes ils) :)
 blockToNodes (Div _ bs) = (blocksToNodes bs ++)
 blockToNodes (DefinitionList items) = blockToNodes (BulletList items')
   where items' = map dlToBullet items
@@ -128,7 +129,7 @@ blockToNodes (DefinitionList items) = blockToNodes (BulletList items')
         dlToBullet (term, xs) =
           Para term : concat xs
 blockToNodes t@(Table _ _ _ _ _) =
-  (node (HTML (T.pack $! writeHtmlString def $! Pandoc nullMeta [t])) [] :)
+  (node (HTML_BLOCK (T.pack $! writeHtmlString def $! Pandoc nullMeta [t])) [] :)
 blockToNodes Null = id
 
 inlinesToNodes :: [Inline] -> [Node]
@@ -138,28 +139,29 @@ inlineToNodes :: Inline -> [Node] -> [Node]
 inlineToNodes (Str s) = (node (TEXT (T.pack s)) [] :)
 inlineToNodes Space   = (node (TEXT (T.pack " ")) [] :)
 inlineToNodes LineBreak = (node LINEBREAK [] :)
+inlineToNodes SoftBreak = (node SOFTBREAK [] :)
 inlineToNodes (Emph xs) = (node EMPH (inlinesToNodes xs) :)
 inlineToNodes (Strong xs) = (node STRONG (inlinesToNodes xs) :)
 inlineToNodes (Strikeout xs) =
-  ((node (INLINE_HTML (T.pack "<s>")) [] : inlinesToNodes xs ++
-   [node (INLINE_HTML (T.pack "</s>")) []]) ++ )
+  ((node (HTML_INLINE (T.pack "<s>")) [] : inlinesToNodes xs ++
+   [node (HTML_INLINE (T.pack "</s>")) []]) ++ )
 inlineToNodes (Superscript xs) =
-  ((node (INLINE_HTML (T.pack "<sub>")) [] : inlinesToNodes xs ++
-   [node (INLINE_HTML (T.pack "</sub>")) []]) ++ )
+  ((node (HTML_INLINE (T.pack "<sup>")) [] : inlinesToNodes xs ++
+   [node (HTML_INLINE (T.pack "</sup>")) []]) ++ )
 inlineToNodes (Subscript xs) =
-  ((node (INLINE_HTML (T.pack "<sup>")) [] : inlinesToNodes xs ++
-   [node (INLINE_HTML (T.pack "</sup>")) []]) ++ )
+  ((node (HTML_INLINE (T.pack "<sub>")) [] : inlinesToNodes xs ++
+   [node (HTML_INLINE (T.pack "</sub>")) []]) ++ )
 inlineToNodes (SmallCaps xs) =
-  ((node (INLINE_HTML (T.pack "<span style=\"font-variant:small-caps;\">")) []
+  ((node (HTML_INLINE (T.pack "<span style=\"font-variant:small-caps;\">")) []
     : inlinesToNodes xs ++
-    [node (INLINE_HTML (T.pack "</span>")) []]) ++ )
-inlineToNodes (Link ils (url,tit)) =
+    [node (HTML_INLINE (T.pack "</span>")) []]) ++ )
+inlineToNodes (Link _ ils (url,tit)) =
   (node (LINK (T.pack url) (T.pack tit)) (inlinesToNodes ils) :)
-inlineToNodes (Image ils (url,tit)) =
+inlineToNodes (Image _ ils (url,tit)) =
   (node (IMAGE (T.pack url) (T.pack tit)) (inlinesToNodes ils) :)
 inlineToNodes (RawInline fmt xs)
-  | fmt == Format "html" = (node (INLINE_HTML (T.pack xs)) [] :)
-  | otherwise = id
+  | fmt == Format "html" = (node (HTML_INLINE (T.pack xs)) [] :)
+  | otherwise = (node (CUSTOM_INLINE (T.pack xs) (T.empty)) [] :)
 inlineToNodes (Quoted qt ils) =
   ((node (TEXT start) [] : inlinesToNodes ils ++ [node (TEXT end) []]) ++)
   where (start, end) = case qt of
@@ -169,9 +171,9 @@ inlineToNodes (Code _ str) = (node (CODE (T.pack str)) [] :)
 inlineToNodes (Math mt str) =
   case mt of
     InlineMath  ->
-      (node (INLINE_HTML (T.pack ("\\(" ++ str ++ "\\)"))) [] :)
+      (node (HTML_INLINE (T.pack ("\\(" ++ str ++ "\\)"))) [] :)
     DisplayMath ->
-      (node (INLINE_HTML (T.pack ("\\[" ++ str ++ "\\]"))) [] :)
+      (node (HTML_INLINE (T.pack ("\\[" ++ str ++ "\\]"))) [] :)
 inlineToNodes (Span _ ils) = (inlinesToNodes ils ++)
 inlineToNodes (Cite _ ils) = (inlinesToNodes ils ++)
 inlineToNodes (Note _) = id -- should not occur

@@ -46,11 +46,12 @@ import Text.Pandoc.Parsing hiding (blankline, space)
 import Data.Maybe (fromMaybe)
 import Data.List ( stripPrefix, intersperse, intercalate )
 import Text.Pandoc.Pretty
+import Text.Pandoc.ImageSize
 import Control.Monad.State
 import qualified Data.Map as M
 import Data.Aeson (Value(String), fromJSON, toJSON, Result(..))
 import qualified Data.Text as T
-import Control.Applicative ((<*), (*>))
+import Data.Char (isSpace, isPunctuation)
 
 data WriterState = WriterState { defListMarker :: String
                                , orderedListLevel :: Int
@@ -73,7 +74,7 @@ pandocToAsciiDoc :: WriterOptions -> Pandoc -> State WriterState String
 pandocToAsciiDoc opts (Pandoc meta blocks) = do
   let titleblock = not $ null (docTitle meta) && null (docAuthors meta) &&
                          null (docDate meta)
-  let colwidth = if writerWrapText opts
+  let colwidth = if writerWrapText opts == WrapAuto
                     then Just $ writerColumns opts
                     else Nothing
   metadata <- metaToJSON opts
@@ -91,12 +92,13 @@ pandocToAsciiDoc opts (Pandoc meta blocks) = do
   let main = render colwidth body
   let context  = defField "body" main
                $ defField "toc"
-                  (writerTableOfContents opts && writerStandalone opts)
+                  (writerTableOfContents opts &&
+                   writerTemplate opts /= Nothing)
                $ defField "titleblock" titleblock
                $ metadata'
-  if writerStandalone opts
-     then return $ renderTemplate' (writerTemplate opts) context
-     else return main
+  case writerTemplate opts of
+       Nothing  -> return main
+       Just tpl -> return $ renderTemplate' tpl context
 
 -- | Escape special characters for AsciiDoc.
 escapeString :: String -> String
@@ -127,8 +129,8 @@ blockToAsciiDoc _ Null = return empty
 blockToAsciiDoc opts (Plain inlines) = do
   contents <- inlineListToAsciiDoc opts inlines
   return $ contents <> blankline
-blockToAsciiDoc opts (Para [Image alt (src,'f':'i':'g':':':tit)]) = do
-  blockToAsciiDoc opts (Para [Image alt (src,tit)])
+blockToAsciiDoc opts (Para [Image attr alt (src,'f':'i':'g':':':tit)]) = do
+  blockToAsciiDoc opts (Para [Image attr alt (src,tit)])
 blockToAsciiDoc opts (Para inlines) = do
   contents <- inlineListToAsciiDoc opts inlines
   -- escape if para starts with ordered list marker
@@ -136,6 +138,13 @@ blockToAsciiDoc opts (Para inlines) = do
                then text "\\"
                else empty
   return $ esc <> contents <> blankline
+blockToAsciiDoc opts (LineBlock lns) = do
+  let docify line = if null line
+                    then return blankline
+                    else inlineListToAsciiDoc opts line
+  let joinWithLinefeeds = nowrap . mconcat . intersperse cr
+  contents <- joinWithLinefeeds <$> mapM docify lns
+  return $ "[verse]" $$ text "--" $$ contents $$ text "--" $$ blankline
 blockToAsciiDoc _ (RawBlock f s)
   | f == "asciidoc" = return $ text s
   | otherwise       = return empty
@@ -160,13 +169,12 @@ blockToAsciiDoc opts (Header level (ident,_,_) inlines) = do
                _  -> empty) <> blankline
             else
               identifier $$ text (replicate level '=') <> space <> contents <> blankline)
-blockToAsciiDoc _ (CodeBlock (_,classes,_) str) = return $
-  flush (attrs <> dashes <> space <> attrs <> cr <> text str <>
-           cr <> dashes) <> blankline
-     where dashes  = text $ replicate (maximum $ map length $ lines str) '-'
-           attrs = if null classes
-                      then empty
-                      else text $ intercalate "," $ "code" : classes
+blockToAsciiDoc _ (CodeBlock (_,classes,_) str) = return $ (flush $
+  if null classes
+     then "...." $$ text str $$ "...."
+     else attrs $$ "----" $$ text str $$ "----")
+  <> blankline
+    where attrs = "[" <> text (intercalate "," ("source" : classes)) <> "]"
 blockToAsciiDoc opts (BlockQuote blocks) = do
   contents <- blockListToAsciiDoc opts blocks
   let isBlock (BlockQuote _) = True
@@ -228,7 +236,7 @@ blockToAsciiDoc opts (Table caption aligns widths headers rows) =  do
   rows' <- mapM makeRow rows
   head' <- makeRow headers
   let head'' = if all null headers then empty else head'
-  let colwidth = if writerWrapText opts
+  let colwidth = if writerWrapText opts == WrapAuto
                     then writerColumns opts
                     else 100000
   let maxwidth = maximum $ map offset (head':rows')
@@ -254,7 +262,10 @@ blockToAsciiDoc opts (OrderedList (_start, sty, _delim) items) = do
 blockToAsciiDoc opts (DefinitionList items) = do
   contents <- mapM (definitionListItemToAsciiDoc opts) items
   return $ cat contents <> blankline
-blockToAsciiDoc opts (Div _ bs) = blockListToAsciiDoc opts bs
+blockToAsciiDoc opts (Div (ident,_,_) bs) = do
+  let identifier = if (null ident) then empty else ("[[" <> text ident <> "]]")
+  contents <- blockListToAsciiDoc opts bs
+  return $ identifier $$ contents
 
 -- | Convert bullet list item (list of blocks) to asciidoc.
 bulletListItemToAsciiDoc :: WriterOptions -> [Block] -> State WriterState Doc
@@ -319,6 +330,8 @@ blockListToAsciiDoc :: WriterOptions -- ^ Options
                     -> State WriterState Doc
 blockListToAsciiDoc opts blocks = cat `fmap` mapM (blockToAsciiDoc opts) blocks
 
+data SpacyLocation = End | Start
+
 -- | Convert list of Pandoc inline elements to asciidoc.
 inlineListToAsciiDoc :: WriterOptions -> [Inline] -> State WriterState Doc
 inlineListToAsciiDoc opts lst = do
@@ -329,14 +342,14 @@ inlineListToAsciiDoc opts lst = do
   return result
  where go [] = return empty
        go (y:x:xs)
-         | not (isSpacy y) = do
-           y' <- if isSpacy x
+         | not (isSpacy End y) = do
+           y' <- if isSpacy Start x
                     then inlineToAsciiDoc opts y
                     else withIntraword $ inlineToAsciiDoc opts y
            x' <- withIntraword $ inlineToAsciiDoc opts x
            xs' <- go xs
            return (y' <> x' <> xs')
-         | x /= Space && x /= LineBreak = do
+         | not (isSpacy Start x) = do
            y' <- withIntraword $ inlineToAsciiDoc opts y
            xs' <- go (x:xs)
            return (y' <> xs')
@@ -344,9 +357,17 @@ inlineListToAsciiDoc opts lst = do
            x' <- inlineToAsciiDoc opts x
            xs' <- go xs
            return (x' <> xs')
-       isSpacy Space = True
-       isSpacy LineBreak = True
-       isSpacy _ = False
+       isSpacy :: SpacyLocation -> Inline -> Bool
+       isSpacy _ Space = True
+       isSpacy _ LineBreak = True
+       isSpacy _ SoftBreak = True
+       -- Note that \W characters count as spacy in AsciiDoc
+       -- for purposes of determining interword:
+       isSpacy End (Str xs) = case reverse xs of
+                                   c:_ -> isPunctuation c || isSpace c
+                                   _   -> False
+       isSpacy Start (Str (c:_)) = isPunctuation c || isSpace c
+       isSpacy _ _ = False
 
 setIntraword :: Bool -> State WriterState ()
 setIntraword b = modify $ \st -> st{ intraword = b }
@@ -392,8 +413,13 @@ inlineToAsciiDoc _ (RawInline f s)
   | otherwise       = return empty
 inlineToAsciiDoc _ (LineBreak) = return $ " +" <> cr
 inlineToAsciiDoc _ Space = return space
+inlineToAsciiDoc opts SoftBreak =
+  case writerWrapText opts of
+       WrapAuto -> return space
+       WrapPreserve -> return cr
+       WrapNone -> return space
 inlineToAsciiDoc opts (Cite _ lst) = inlineListToAsciiDoc opts lst
-inlineToAsciiDoc opts (Link txt (src, _tit)) = do
+inlineToAsciiDoc opts (Link _ txt (src, _tit)) = do
 -- relative:  link:downloads/foo.zip[download foo.zip]
 -- abs:  http://google.cod[Google]
 -- or my@email.com[email john]
@@ -409,7 +435,7 @@ inlineToAsciiDoc opts (Link txt (src, _tit)) = do
   return $ if useAuto
               then text srcSuffix
               else prefix <> text src <> "[" <> linktext <> "]"
-inlineToAsciiDoc opts (Image alternate (src, tit)) = do
+inlineToAsciiDoc opts (Image attr alternate (src, tit)) = do
 -- image:images/logo.png[Company logo, title="blah"]
   let txt = if (null alternate) || (alternate == [Str ""])
                then [Str "image"]
@@ -417,8 +443,19 @@ inlineToAsciiDoc opts (Image alternate (src, tit)) = do
   linktext <- inlineListToAsciiDoc opts txt
   let linktitle = if null tit
                      then empty
-                     else text $ ",title=\"" ++ tit ++ "\""
-  return $ "image:" <> text src <> "[" <> linktext <> linktitle <> "]"
+                     else ",title=\"" <> text tit <> "\""
+      showDim dir = case (dimension dir attr) of
+                      Just (Percent a) ->
+                        ["scaledwidth=" <> text (show (Percent a))]
+                      Just dim         ->
+                        [text (show dir) <> "=" <> text (showInPixel opts dim)]
+                      Nothing          ->
+                        []
+      dimList = showDim Width ++ showDim Height
+      dims = if null dimList
+                then empty
+                else "," <> cat (intersperse "," dimList)
+  return $ "image:" <> text src <> "[" <> linktext <> linktitle <> dims <> "]"
 inlineToAsciiDoc opts (Note [Para inlines]) =
   inlineToAsciiDoc opts (Note [Plain inlines])
 inlineToAsciiDoc opts (Note [Plain inlines]) = do
@@ -426,4 +463,7 @@ inlineToAsciiDoc opts (Note [Plain inlines]) = do
   return $ text "footnote:[" <> contents <> "]"
 -- asciidoc can't handle blank lines in notes
 inlineToAsciiDoc _ (Note _) = return "[multiblock footnote omitted]"
-inlineToAsciiDoc opts (Span _ ils) = inlineListToAsciiDoc opts ils
+inlineToAsciiDoc opts (Span (ident,_,_) ils) = do
+  let identifier = if (null ident) then empty else ("[[" <> text ident <> "]]")
+  contents <- inlineListToAsciiDoc opts ils
+  return $ identifier <> contents

@@ -34,17 +34,18 @@ import Text.Pandoc.Definition
 import Text.Pandoc.Options
 import Text.Pandoc.Shared
 import Text.Pandoc.Pretty (render)
+import Text.Pandoc.ImageSize
 import Text.Pandoc.Writers.Shared
 import Text.Pandoc.Templates (renderTemplate')
 import Text.Pandoc.XML ( escapeStringForXML )
 import Data.List ( intercalate )
 import Control.Monad.State
-import Control.Applicative ((<$>))
 import Data.Char ( isSpace )
 
 data WriterState = WriterState {
     stNotes     :: [String]        -- Footnotes
   , stListLevel :: [Char]          -- String at beginning of list items, e.g. "**"
+  , stStartNum  :: Maybe Int       -- Start number if first list item
   , stUseTags   :: Bool            -- True if we should use HTML tags because we're in a complex list
   }
 
@@ -52,7 +53,8 @@ data WriterState = WriterState {
 writeTextile :: WriterOptions -> Pandoc -> String
 writeTextile opts document =
   evalState (pandocToTextile opts document)
-            WriterState { stNotes = [], stListLevel = [], stUseTags = False }
+            WriterState { stNotes = [], stListLevel = [], stStartNum = Nothing,
+                          stUseTags = False }
 
 -- | Return Textile representation of document.
 pandocToTextile :: WriterOptions -> Pandoc -> State WriterState String
@@ -63,9 +65,9 @@ pandocToTextile opts (Pandoc meta blocks) = do
   notes <- liftM (unlines . reverse . stNotes) get
   let main = body ++ if null notes then "" else ("\n\n" ++ notes)
   let context = defField "body" main metadata
-  if writerStandalone opts
-     then return $ renderTemplate' (writerTemplate opts) context
-     else return main
+  case writerTemplate opts of
+       Nothing  -> return main
+       Just tpl -> return $ renderTemplate' tpl context
 
 withUseTags :: State WriterState a -> State WriterState a
 withUseTags action = do
@@ -85,6 +87,8 @@ escapeCharForTextile x = case x of
                          '*'      -> "&#42;"
                          '_'      -> "&#95;"
                          '@'      -> "&#64;"
+                         '+'      -> "&#43;"
+                         '-'      -> "&#45;"
                          '|'      -> "&#124;"
                          '\x2014' -> " -- "
                          '\x2013' -> " - "
@@ -113,9 +117,9 @@ blockToTextile opts (Plain inlines) =
   inlineListToTextile opts inlines
 
 -- title beginning with fig: indicates that the image is a figure
-blockToTextile opts (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
+blockToTextile opts (Para [Image attr txt (src,'f':'i':'g':':':tit)]) = do
   capt <- blockToTextile opts (Para txt)
-  im <- inlineToTextile opts (Image txt (src,tit))
+  im <- inlineToTextile opts (Image attr txt (src,tit))
   return $ im ++ "\n" ++ capt
 
 blockToTextile opts (Para inlines) = do
@@ -125,6 +129,9 @@ blockToTextile opts (Para inlines) = do
   return $ if useTags
               then "<p>" ++ contents ++ "</p>"
               else contents ++ if null listLevel then "\n" else ""
+
+blockToTextile opts (LineBlock lns) =
+  blockToTextile opts $ linesToPara lns
 
 blockToTextile _ (RawBlock f str)
   | f == Format "html" || f == Format "textile" = return str
@@ -217,7 +224,7 @@ blockToTextile opts x@(BulletList items) = do
         modify $ \s -> s { stListLevel = init (stListLevel s) }
         return $ vcat contents ++ (if level > 1 then "" else "\n")
 
-blockToTextile opts x@(OrderedList attribs items) = do
+blockToTextile opts x@(OrderedList attribs@(start, _, _) items) = do
   oldUseTags <- liftM stUseTags get
   let useTags = oldUseTags || not (isSimpleList x)
   if useTags
@@ -226,10 +233,14 @@ blockToTextile opts x@(OrderedList attribs items) = do
         return $ "<ol" ++ listAttribsToString attribs ++ ">\n" ++ vcat contents ++
                    "\n</ol>\n"
      else do
-        modify $ \s -> s { stListLevel = stListLevel s ++ "#" }
+        modify $ \s -> s { stListLevel = stListLevel s ++ "#"
+                         , stStartNum = if start > 1
+                                           then Just start
+                                           else Nothing }
         level <- get >>= return . length . stListLevel
         contents <- mapM (listItemToTextile opts) items
-        modify $ \s -> s { stListLevel = init (stListLevel s) }
+        modify $ \s -> s { stListLevel = init (stListLevel s),
+                           stStartNum = Nothing }
         return $ vcat contents ++ (if level > 1 then "" else "\n")
 
 blockToTextile opts (DefinitionList items) = do
@@ -257,8 +268,13 @@ listItemToTextile opts items = do
   if useTags
      then return $ "<li>" ++ contents ++ "</li>"
      else do
-       marker <- get >>= return . stListLevel
-       return $ marker ++ " " ++ contents
+       marker <- gets stListLevel
+       mbstart <- gets stStartNum
+       case mbstart of
+            Just n -> do
+              modify $ \s -> s{ stStartNum = Nothing }
+              return $ marker ++ show n ++ " " ++ contents
+            Nothing -> return $ marker ++ " " ++ contents
 
 -- | Convert definition list item (label, list of blocks) to Textile.
 definitionListItemToTextile :: WriterOptions
@@ -275,8 +291,8 @@ isSimpleList :: Block -> Bool
 isSimpleList x =
   case x of
        BulletList items                 -> all isSimpleListItem items
-       OrderedList (num, sty, _) items  -> all isSimpleListItem items &&
-                                            num == 1 && sty `elem` [DefaultStyle, Decimal]
+       OrderedList (_, sty, _) items    -> all isSimpleListItem items &&
+                                            sty `elem` [DefaultStyle, Decimal]
        _                                -> False
 
 -- | True if list item can be handled with the simple wiki syntax.  False if
@@ -421,25 +437,43 @@ inlineToTextile opts (RawInline f str)
 
 inlineToTextile _ (LineBreak) = return "\n"
 
+inlineToTextile _ SoftBreak = return " "
+
 inlineToTextile _ Space = return " "
 
-inlineToTextile opts (Link txt (src, _)) = do
+inlineToTextile opts (Link (_, cls, _) txt (src, _)) = do
+  let classes = if null cls
+                   then ""
+                   else "(" ++ unwords cls ++ ")"
   label <- case txt of
                 [Code _ s]
                  | s == src -> return "$"
                 [Str s]
                  | s == src -> return "$"
                 _           -> inlineListToTextile opts txt
-  return $ "\"" ++ label ++ "\":" ++ src
+  return $ "\"" ++ classes ++ label ++ "\":" ++ src
 
-inlineToTextile opts (Image alt (source, tit)) = do
+inlineToTextile opts (Image attr@(_, cls, _) alt (source, tit)) = do
   alt' <- inlineListToTextile opts alt
   let txt = if null tit
                then if null alt'
                        then ""
                        else "(" ++ alt' ++ ")"
                else "(" ++ tit ++ ")"
-  return $ "!" ++ source ++ txt ++ "!"
+      classes = if null cls
+                   then ""
+                   else "(" ++ unwords cls ++ ")"
+      showDim dir = let toCss str = Just $ show dir ++ ":" ++ str ++ ";"
+                    in case (dimension dir attr) of
+                         Just (Percent a) -> toCss $ show (Percent a)
+                         Just dim         -> toCss $ showInPixel opts dim ++ "px"
+                         Nothing          -> Nothing
+      styles = case (showDim Width, showDim Height) of
+                 (Just w, Just h)   -> "{" ++ w ++ h ++ "}"
+                 (Just w, Nothing)  -> "{" ++ w ++ "height:auto;}"
+                 (Nothing, Just h)  -> "{" ++ "width:auto;" ++ h ++ "}"
+                 (Nothing, Nothing) -> ""
+  return $ "!" ++ classes ++ styles ++ source ++ txt ++ "!"
 
 inlineToTextile opts (Note contents) = do
   curNotes <- liftM stNotes get

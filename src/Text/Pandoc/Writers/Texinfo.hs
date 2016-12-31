@@ -40,15 +40,18 @@ import Data.Ord ( comparing )
 import Data.Char ( chr, ord )
 import Control.Monad.State
 import Text.Pandoc.Pretty
+import Text.Pandoc.ImageSize
 import Network.URI ( isURI, unEscapeString )
 import System.FilePath
+import qualified Data.Set as Set
 
 data WriterState =
   WriterState { stStrikeout   :: Bool  -- document contains strikeout
               , stSuperscript :: Bool -- document contains superscript
               , stSubscript   :: Bool -- document contains subscript
               , stEscapeComma :: Bool -- in a context where we need @comma
-              , stIdentifiers :: [String] -- header ids used already
+              , stIdentifiers :: Set.Set String -- header ids used already
+              , stOptions     :: WriterOptions -- writer options
               }
 
 {- TODO:
@@ -61,7 +64,8 @@ writeTexinfo :: WriterOptions -> Pandoc -> String
 writeTexinfo options document =
   evalState (pandocToTexinfo options $ wrapTop document) $
   WriterState { stStrikeout = False, stSuperscript = False,
-                stEscapeComma = False, stSubscript = False, stIdentifiers = [] }
+                stEscapeComma = False, stSubscript = False,
+                stIdentifiers = Set.empty, stOptions = options}
 
 -- | Add a "Top" node around the document, needed by Texinfo.
 wrapTop :: Pandoc -> Pandoc
@@ -72,7 +76,7 @@ pandocToTexinfo :: WriterOptions -> Pandoc -> State WriterState String
 pandocToTexinfo options (Pandoc meta blocks) = do
   let titlePage = not $ all null
                       $ docTitle meta : docDate meta : docAuthors meta
-  let colwidth = if writerWrapText options
+  let colwidth = if writerWrapText options == WrapAuto
                     then Just $ writerColumns options
                     else Nothing
   metadata <- metaToJSON options
@@ -89,9 +93,9 @@ pandocToTexinfo options (Pandoc meta blocks) = do
               $ defField "superscript" (stSuperscript st)
               $ defField "strikeout" (stStrikeout st)
               $ metadata
-  if writerStandalone options
-     then return $ renderTemplate' (writerTemplate options) context
-     else return body
+  case writerTemplate options of
+       Nothing  -> return body
+       Just tpl -> return $ renderTemplate' tpl context
 
 -- | Escape things as needed for Texinfo.
 stringToTexinfo :: String -> String
@@ -120,7 +124,7 @@ inCmd cmd contents = char '@' <> text cmd <> braces contents
 
 -- | Convert Pandoc block element to Texinfo.
 blockToTexinfo :: Block     -- ^ Block to convert
-	       -> State WriterState Doc
+               -> State WriterState Doc
 
 blockToTexinfo Null = return empty
 
@@ -130,16 +134,19 @@ blockToTexinfo (Plain lst) =
   inlineListToTexinfo lst
 
 -- title beginning with fig: indicates that the image is a figure
-blockToTexinfo (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
+blockToTexinfo (Para [Image attr txt (src,'f':'i':'g':':':tit)]) = do
   capt <- if null txt
              then return empty
              else (\c -> text "@caption" <> braces c) `fmap`
                     inlineListToTexinfo txt
-  img  <- inlineToTexinfo (Image txt (src,tit))
+  img  <- inlineToTexinfo (Image attr txt (src,tit))
   return $ text "@float" $$ img $$ capt $$ text "@end float"
 
 blockToTexinfo (Para lst) =
   inlineListToTexinfo lst    -- this is handled differently from Plain in blockListToTexinfo
+
+blockToTexinfo (LineBlock lns) =
+  blockToTexinfo $ linesToPara lns
 
 blockToTexinfo (BlockQuote lst) = do
   contents <- blockListToTexinfo lst
@@ -195,9 +202,9 @@ blockToTexinfo HorizontalRule =
     -- XXX can't get the equivalent from LaTeX.hs to work
     return $ text "@iftex" $$
              text "@bigskip@hrule@bigskip" $$
-	     text "@end iftex" $$
+             text "@end iftex" $$
              text "@ifnottex" $$
-	     text (take 72 $ repeat '-') $$
+             text (take 72 $ repeat '-') $$
              text "@end ifnottex"
 
 blockToTexinfo (Header 0 _ lst) = do
@@ -212,7 +219,7 @@ blockToTexinfo (Header level _ lst) = do
   txt <- inlineListToTexinfo lst
   idsUsed <- gets stIdentifiers
   let id' = uniqueIdent lst idsUsed
-  modify $ \st -> st{ stIdentifiers = id' : idsUsed }
+  modify $ \st -> st{ stIdentifiers = Set.insert id' idsUsed }
   return $ if (level > 0) && (level <= 4)
               then blankline <> text "@node " <> node $$
                    text (seccmd level) <> txt $$
@@ -422,13 +429,19 @@ inlineToTexinfo (RawInline f str)
   | f == "texinfo" =  return $ text str
   | otherwise      =  return empty
 inlineToTexinfo (LineBreak) = return $ text "@*" <> cr
+inlineToTexinfo SoftBreak = do
+  wrapText <- gets (writerWrapText . stOptions)
+  case wrapText of
+      WrapAuto     -> return space
+      WrapNone     -> return space
+      WrapPreserve -> return cr
 inlineToTexinfo Space = return space
 
-inlineToTexinfo (Link txt (src@('#':_), _)) = do
+inlineToTexinfo (Link _ txt (src@('#':_), _)) = do
   contents <- escapeCommas $ inlineListToTexinfo txt
   return $ text "@ref" <>
            braces (text (stringToTexinfo src) <> text "," <> contents)
-inlineToTexinfo (Link txt (src, _)) = do
+inlineToTexinfo (Link _ txt (src, _)) = do
   case txt of
         [Str x] | escapeURI x == src ->  -- autolink
              do return $ text $ "@url{" ++ x ++ "}"
@@ -437,10 +450,16 @@ inlineToTexinfo (Link txt (src, _)) = do
                 return $ text ("@uref{" ++ src1 ++ ",") <> contents <>
                          char '}'
 
-inlineToTexinfo (Image alternate (source, _)) = do
+inlineToTexinfo (Image attr alternate (source, _)) = do
   content <- escapeCommas $ inlineListToTexinfo alternate
-  return $ text ("@image{" ++ base ++ ",,,") <> content <> text "," <>
-           text (ext ++ "}")
+  opts <- gets stOptions
+  let showDim dim = case (dimension dim attr) of
+                      (Just (Pixel a))   -> showInInch opts (Pixel a) ++ "in"
+                      (Just (Percent _)) -> ""
+                      (Just d)           -> show d
+                      Nothing            -> ""
+  return $ text ("@image{" ++ base ++ ',':(showDim Width) ++ ',':(showDim Height) ++ ",")
+           <> content <> text "," <> text (ext ++ "}")
   where
     ext     = drop 1 $ takeExtension source'
     base    = dropExtension source'

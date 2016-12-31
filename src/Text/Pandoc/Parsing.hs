@@ -5,7 +5,7 @@
 , MultiParamTypeClasses
 , FlexibleInstances #-}
 {-
-Copyright (C) 2006-2015 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2006-2016 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -24,7 +24,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Parsing
-   Copyright   : Copyright (C) 2006-2015 John MacFarlane
+   Copyright   : Copyright (C) 2006-2016 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -164,7 +164,8 @@ module Text.Pandoc.Parsing ( anyLine,
                              setSourceLine,
                              newPos,
                              addWarning,
-                             (<+?>)
+                             (<+?>),
+                             extractIdClass
                              )
 where
 
@@ -177,20 +178,19 @@ import qualified Text.Pandoc.UTF8 as UTF8 (putStrLn)
 import Text.Parsec hiding (token)
 import Text.Parsec.Pos (newPos)
 import Data.Char ( toLower, toUpper, ord, chr, isAscii, isAlphaNum,
-                   isHexDigit, isSpace )
-import Data.List ( intercalate, transpose )
+                   isHexDigit, isSpace, isPunctuation )
+import Data.List ( intercalate, transpose, isSuffixOf )
 import Text.Pandoc.Shared
 import qualified Data.Map as M
 import Text.TeXMath.Readers.TeX.Macros (applyMacros, Macro,
                                         parseMacroDefinitions)
-import Text.Pandoc.Compat.TagSoupEntity ( lookupEntity )
+import Text.HTML.TagSoup.Entity ( lookupEntity )
 import Text.Pandoc.Asciify (toAsciiChar)
+import Data.Monoid ((<>))
 import Data.Default
 import qualified Data.Set as Set
 import Control.Monad.Reader
 import Control.Monad.Identity
-import Control.Applicative ((<$>), (<*>), (*>), (<*), (<$), Applicative)
-import Data.Monoid
 import Data.Maybe (catMaybes)
 
 import Text.Pandoc.Error
@@ -405,9 +405,18 @@ emailAddress = try $ toResult <$> mailbox <*> (char '@' *> domain)
        domain            = intercalate "." <$> (subdomain `sepby1` dot)
        dot               = char '.'
        subdomain         = many1 $ alphaNum <|> innerPunct
-       innerPunct        = try (satisfy (\c -> isEmailPunct c || c == '@') <*
-                                 notFollowedBy space)
-       emailWord         = many1 $ satisfy isEmailChar
+       -- this excludes some valid email addresses, since an
+       -- email could contain e.g. '__', but gives better results
+       -- for our purposes, when combined with markdown parsing:
+       innerPunct        = try (satisfy (\c -> isEmailPunct c || c == '@')
+                                 <* notFollowedBy space
+                                 <* notFollowedBy (satisfy isPunctuation))
+       -- technically an email address could begin with a symbol,
+       -- but allowing this creates too many problems.
+       -- See e.g. https://github.com/jgm/pandoc/issues/2940
+       emailWord         = do x <- satisfy isAlphaNum
+                              xs <- many (satisfy isEmailChar)
+                              return (x:xs)
        isEmailChar c     = isAlphaNum c || isEmailPunct c
        isEmailPunct c    = c `elem` "!\"#$%&'*+-/=?^_{|}~;"
        -- note: sepBy1 from parsec consumes input when sep
@@ -448,13 +457,12 @@ uri :: Stream [Char] m Char => ParserT [Char] st m (String, String)
 uri = try $ do
   scheme <- uriScheme
   char ':'
-  -- We allow punctuation except at the end, since
+  -- We allow sentence punctuation except at the end, since
   -- we don't want the trailing '.' in 'http://google.com.' We want to allow
   -- http://en.wikipedia.org/wiki/State_of_emergency_(disambiguation)
   -- as a URL, while NOT picking up the closing paren in
   -- (http://wikipedia.org). So we include balanced parens in the URL.
-  let isWordChar c = isAlphaNum c || c == '_' || c == '/' || c == '+' ||
-                         not (isAscii c)
+  let isWordChar c = isAlphaNum c || c `elem` "#$%*+/@\\_-"
   let wordChar = satisfy isWordChar
   let percentEscaped = try $ char '%' >> skipMany1 (satisfy isHexDigit)
   let entity = () <$ characterReference
@@ -574,9 +582,13 @@ characterReference :: Stream s m Char => ParserT s st m Char
 characterReference = try $ do
   char '&'
   ent <- many1Till nonspaceChar (char ';')
-  case lookupEntity ent of
-       Just c  -> return c
-       Nothing -> fail "entity not found"
+  let ent' = case ent of
+                  '#':'X':xs -> '#':'x':xs  -- workaround tagsoup bug
+                  '#':_  -> ent
+                  _      -> ent ++ ";"
+  case lookupEntity ent' of
+       Just (c : _)  -> return c
+       _             -> fail "entity not found"
 
 -- | Parses an uppercase roman numeral and returns (UpperRoman, number).
 upperRoman :: Stream s m Char => ParserT s st m (ListNumberStyle, Int)
@@ -715,11 +727,14 @@ lineBlockLine = try $ do
   continuations <- many (try $ char ' ' >> anyLine)
   return $ white ++ unwords (line : continuations)
 
+blankLineBlockLine :: Stream [Char] m Char => ParserT [Char] st m Char
+blankLineBlockLine = try (char '|' >> blankline)
+
 -- | Parses an RST-style line block and returns a list of strings.
 lineBlockLines :: Stream [Char] m Char => ParserT [Char] st m [String]
 lineBlockLines = try $ do
-  lines' <- many1 lineBlockLine
-  skipMany1 $ blankline <|> try (char '|' >> blankline)
+  lines' <- many1 (lineBlockLine <|> ((:[]) <$> blankLineBlockLine))
+  skipMany1 $ blankline <|> blankLineBlockLine
   return lines'
 
 -- | Parse a table using 'headerParser', 'rowParser',
@@ -862,13 +877,13 @@ gridTableFooter = blanklines
 ---
 
 -- | Removes the ParsecT layer from the monad transformer stack
-readWithM :: (Monad m, Functor m)
+readWithM :: (Monad m)
           => ParserT [Char] st m a       -- ^ parser
           -> st                       -- ^ initial state
           -> String                   -- ^ input
           -> m (Either PandocError a)
 readWithM parser state input =
-    mapLeft (ParsecError input) <$> runParserT parser state "source" input
+    mapLeft (ParsecError input) `liftM` runParserT parser state "source" input
 
 
 -- | Parse a string with a given parser and state
@@ -888,7 +903,7 @@ readWithWarnings p = readWith $ do
          return (doc, warnings)
 
 -- | Parse a string with @parser@ (for testing).
-testStringWith :: (Show a, Stream [Char] Identity Char)
+testStringWith :: (Show a)
                => ParserT [Char] ParserState Identity a
                -> [Char]
                -> IO ()
@@ -903,7 +918,8 @@ data ParserState = ParserState
       stateAllowLinks      :: Bool,          -- ^ Allow parsing of links
       stateMaxNestingLevel :: Int,           -- ^ Max # of nested Strong/Emph
       stateLastStrPos      :: Maybe SourcePos, -- ^ Position after last str parsed
-      stateKeys            :: KeyTable,      -- ^ List of reference keys (with fallbacks)
+      stateKeys            :: KeyTable,      -- ^ List of reference keys
+      stateHeaderKeys      :: KeyTable,      -- ^ List of implicit header ref keys
       stateSubstitutions   :: SubstTable,    -- ^ List of substitution references
       stateNotes           :: NoteTable,     -- ^ List of notes (raw bodies)
       stateNotes'          :: NoteTable',    -- ^ List of notes (parsed bodies)
@@ -911,7 +927,7 @@ data ParserState = ParserState
       stateMeta'           :: F Meta,        -- ^ Document metadata
       stateHeaderTable     :: [HeaderType],  -- ^ Ordered list of header types used
       stateHeaders         :: M.Map Inlines String, -- ^ List of headers and ids (used for implicit ref links)
-      stateIdentifiers     :: [String],      -- ^ List of header identifiers used
+      stateIdentifiers     :: Set.Set String, -- ^ Header identifiers used
       stateNextExample     :: Int,           -- ^ Number of next example
       stateExamples        :: M.Map String Int, -- ^ Map from example labels to numbers
       stateHasChapters     :: Bool,          -- ^ True if \chapter encountered
@@ -969,8 +985,8 @@ instance HasHeaderMap ParserState where
   updateHeaderMap f st = st{ stateHeaders = f $ stateHeaders st }
 
 class HasIdentifierList st where
-  extractIdentifierList  :: st -> [String]
-  updateIdentifierList   :: ([String] -> [String]) -> st -> st
+  extractIdentifierList  :: st -> Set.Set String
+  updateIdentifierList   :: (Set.Set String -> Set.Set String) -> st -> st
 
 instance HasIdentifierList ParserState where
   extractIdentifierList     = stateIdentifiers
@@ -1001,6 +1017,7 @@ defaultParserState =
                   stateMaxNestingLevel = 6,
                   stateLastStrPos      = Nothing,
                   stateKeys            = M.empty,
+                  stateHeaderKeys      = M.empty,
                   stateSubstitutions   = M.empty,
                   stateNotes           = [],
                   stateNotes'          = [],
@@ -1008,7 +1025,7 @@ defaultParserState =
                   stateMeta'           = return nullMeta,
                   stateHeaderTable     = [],
                   stateHeaders         = M.empty,
-                  stateIdentifiers     = [],
+                  stateIdentifiers     = Set.empty,
                   stateNextExample     = 1,
                   stateExamples        = M.empty,
                   stateHasChapters     = False,
@@ -1062,9 +1079,11 @@ type NoteTable' = [(String, F Blocks)]  -- used in markdown reader
 newtype Key = Key String deriving (Show, Read, Eq, Ord)
 
 toKey :: String -> Key
-toKey = Key . map toLower . unwords . words
+toKey = Key . map toLower . unwords . words . unbracket
+  where unbracket ('[':xs) | "]" `isSuffixOf` xs = take (length xs - 1) xs
+        unbracket xs       = xs
 
-type KeyTable = M.Map Key Target
+type KeyTable = M.Map Key (Target, Attr)
 
 type SubstTable = M.Map Key Inlines
 
@@ -1085,8 +1104,8 @@ registerHeader (ident,classes,kvs) header' = do
        let id'' = if Ext_ascii_identifiers `Set.member` exts
                      then catMaybes $ map toAsciiChar id'
                      else id'
-       updateState $ updateIdentifierList $
-         if id' == id'' then (id' :) else ([id', id''] ++)
+       updateState $ updateIdentifierList $ Set.insert id'
+       updateState $ updateIdentifierList $ Set.insert id''
        updateState $ updateHeaderMap $ insert' header' id'
        return (id'',classes,kvs)
      else do
@@ -1206,10 +1225,11 @@ citeKey = try $ do
   guard =<< notAfterString
   suppress_author <- option False (char '-' *> return True)
   char '@'
-  firstChar <- alphaNum <|> char '_'
+  firstChar <- alphaNum <|> char '_' <|> char '*' -- @* for wildcard in nocite
   let regchar = satisfy (\c -> isAlphaNum c || c == '_')
   let internal p = try $ p <* lookAhead regchar
-  rest <- many $ regchar <|> internal (oneOf ":.#$%&-+?<>~/")
+  rest <- many $ regchar <|> internal (oneOf ":.#$%&-+?<>~/") <|>
+                 try (oneOf ":/" <* lookAhead (char '/'))
   let key = firstChar:rest
   return (suppress_author, key)
 
@@ -1259,5 +1279,16 @@ addWarning mbpos msg =
     stateWarnings = (msg ++ maybe "" (\pos -> " " ++ show pos) mbpos) :
                      stateWarnings st }
 infixr 5 <+?>
-(<+?>) :: (Monoid a, Monad m) => ParserT s st m a -> ParserT s st m a -> ParserT s st m a
+(<+?>) :: (Monoid a) => ParserT s st m a -> ParserT s st m a -> ParserT s st m a
 a <+?> b = a >>= flip fmap (try b <|> return mempty) . (<>)
+
+extractIdClass :: Attr -> Attr
+extractIdClass (ident, cls, kvs) = (ident', cls', kvs')
+  where
+    ident' = case (lookup "id" kvs) of
+               Just v  -> v
+               Nothing -> ident
+    cls'   = case (lookup "class" kvs) of
+               Just cl -> words cl
+               Nothing -> cls
+    kvs'  = filter (\(k,_) -> k /= "id" || k /= "class") kvs

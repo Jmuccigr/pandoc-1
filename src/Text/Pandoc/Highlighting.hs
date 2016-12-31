@@ -1,5 +1,5 @@
 {-
-Copyright (C) 2008-2015 John MacFarlane <jgm@berkeley.edu>
+Copyright (C) 2008-2016 John MacFarlane <jgm@berkeley.edu>
 
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 
 {- |
    Module      : Text.Pandoc.Highlighting
-   Copyright   : Copyright (C) 2008-2015 John MacFarlane
+   Copyright   : Copyright (C) 2008-2016 John MacFarlane
    License     : GNU GPL, version 2 or above
 
    Maintainer  : John MacFarlane <jgm@berkeley.edu>
@@ -50,40 +50,49 @@ module Text.Pandoc.Highlighting ( languages
                                 ) where
 import Text.Pandoc.Definition
 import Text.Pandoc.Shared (safeRead)
-import Text.Highlighting.Kate
-import Data.List (find)
+import Skylighting
 import Data.Maybe (fromMaybe)
 import Data.Char (toLower)
 import qualified Data.Map as M
 import Control.Applicative ((<|>))
+import Control.Monad
+import qualified Data.Text as T
 
-lcLanguages :: [String]
-lcLanguages = map (map toLower) languages
+languages :: [String]
+languages = [T.unpack (T.toLower (sName s)) | s <- M.elems defaultSyntaxMap]
+
+languagesByExtension :: String -> [String]
+languagesByExtension ext =
+  [T.unpack (T.toLower (sName s)) | s <- syntaxesByExtension defaultSyntaxMap ext]
 
 highlight :: (FormatOptions -> [SourceLine] -> a) -- ^ Formatter
           -> Attr   -- ^ Attributes of the CodeBlock
           -> String -- ^ Raw contents of the CodeBlock
           -> Maybe a -- ^ Maybe the formatted result
 highlight formatter (_, classes, keyvals) rawCode =
-  let firstNum = case safeRead (fromMaybe "1" $ lookup "startFrom" keyvals) of
-                      Just n  -> n
-                      Nothing -> 1
+  let firstNum = fromMaybe 1 (safeRead (fromMaybe "1" $ lookup "startFrom" keyvals))
       fmtOpts = defaultFormatOpts{
                   startNumber = firstNum,
                   numberLines = any (`elem`
                         ["number","numberLines", "number-lines"]) classes }
-      lcclasses = map (map toLower) classes
-  in  case find (`elem` lcLanguages) lcclasses of
+      tokenizeOpts = TokenizerConfig{ syntaxMap = defaultSyntaxMap
+                                    , traceOutput = False }
+      classes' = map T.pack classes
+      rawCode' = T.pack rawCode
+  in  case msum (map (\l -> lookupSyntax l defaultSyntaxMap) classes') of
             Nothing
               | numberLines fmtOpts -> Just
                               $ formatter fmtOpts{ codeClasses = [],
-                                                   containerClasses = classes }
-                              $ map (\ln -> [(NormalTok, ln)]) $ lines rawCode
+                                                   containerClasses = classes' }
+                              $ map (\ln -> [(NormalTok, ln)]) $ T.lines rawCode'
               | otherwise  -> Nothing
-            Just language  -> Just
-                              $ formatter fmtOpts{ codeClasses = [language],
-                                                   containerClasses = classes }
-                              $ highlightAs language rawCode
+            Just syntax  ->
+              case tokenize tokenizeOpts syntax rawCode' of
+                   Right slines -> Just $
+                         formatter fmtOpts{ codeClasses =
+                                               [T.toLower (sShortname syntax)],
+                                            containerClasses = classes' } slines
+                   Left _ -> Nothing
 
 -- Functions for correlating latex listings package's language names
 -- with highlighting-kate language names:
@@ -126,6 +135,7 @@ langsList =    [("ada","Ada")
                ,("php","PHP")
                ,("xslt","XSLT")
                ,("html","HTML")
+               ,("gap","GAP")
                ]
 
 listingsLangs :: [String]
@@ -140,7 +150,7 @@ listingsLangs = ["Ada","Java","Prolog","Algol","JVMIS","Promela",
                  "Oberon-2","TeX","erlang","OCL","VBScript","Euphoria",
                  "Octave","Verilog","Fortran","Oz","VHDL","GCL",
                  "Pascal","VRML","Gnuplot","Perl","XML","Haskell",
-                 "PHP","XSLT","HTML","PL/I"]
+                 "PHP","XSLT","HTML","PL/I","GAP"]
 
 -- Determine listings language name from highlighting-kate language name.
 toListingsLanguage :: String -> Maybe String

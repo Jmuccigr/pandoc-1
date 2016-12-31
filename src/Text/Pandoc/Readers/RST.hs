@@ -39,18 +39,16 @@ import Text.Pandoc.Shared
 import Text.Pandoc.Parsing
 import Text.Pandoc.Options
 import Control.Monad ( when, liftM, guard, mzero )
-import Data.List ( findIndex, intersperse, intercalate,
+import Data.List ( findIndex, intercalate,
                    transpose, sort, deleteFirstsBy, isSuffixOf , nub, union)
 import Data.Maybe (fromMaybe)
 import qualified Data.Map as M
 import Text.Printf ( printf )
-import Control.Applicative ((<$>), (<$), (<*), (*>), (<*>), pure)
-import Text.Pandoc.Builder (Inlines, Blocks, trimInlines, (<>))
+import Text.Pandoc.Builder (Inlines, Blocks, trimInlines)
 import qualified Text.Pandoc.Builder as B
-import Data.Monoid (mconcat, mempty)
 import Data.Sequence (viewr, ViewR(..))
 import Data.Char (toLower, isHexDigit, isSpace)
-
+import Data.Monoid ((<>))
 import Text.Pandoc.Error
 
 -- | Parse reStructuredText string and return Pandoc document.
@@ -209,7 +207,7 @@ rawFieldListItem minIndent = try $ do
 fieldListItem :: Int -> RSTParser (Inlines, [Blocks])
 fieldListItem minIndent = try $ do
   (name, raw) <- rawFieldListItem minIndent
-  let term = B.str name
+  term <- parseInlineFromString name
   contents <- parseFromString parseBlocks raw
   optional blanklines
   return (term, [contents])
@@ -229,9 +227,8 @@ fieldList = try $ do
 lineBlock :: RSTParser Blocks
 lineBlock = try $ do
   lines' <- lineBlockLines
-  lines'' <- mapM (parseFromString
-                   (trimInlines . mconcat <$> many inline)) lines'
-  return $ B.para (mconcat $ intersperse B.linebreak lines'')
+  lines'' <- mapM parseInlineFromString lines'
+  return $ B.lineBlock lines''
 
 --
 -- paragraph block
@@ -544,53 +541,52 @@ directive' = do
   body <- option "" $ try $ blanklines >> indentedBlock
   optional blanklines
   let body' = body ++ "\n\n"
+      imgAttr cl = ("", classes, getAtt "width" ++ getAtt "height")
+        where
+          classes = words $ maybe "" trim $ lookup cl fields
+          getAtt k = case lookup k fields of
+                       Just v  -> [(k, filter (not . isSpace) v)]
+                       Nothing -> []
   case label of
         "raw" -> return $ B.rawBlock (trim top) (stripTrailingNewlines body)
         "role" -> addNewRole top $ map (\(k,v) -> (k, trim v)) fields
         "container" -> parseFromString parseBlocks body'
         "replace" -> B.para <$>  -- consumed by substKey
-                   parseFromString (trimInlines . mconcat <$> many inline)
-                   (trim top)
+                   parseInlineFromString (trim top)
         "unicode" -> B.para <$>  -- consumed by substKey
-                   parseFromString (trimInlines . mconcat <$> many inline)
-                   (trim $ unicodeTransform top)
+                   parseInlineFromString (trim $ unicodeTransform top)
         "compound" -> parseFromString parseBlocks body'
         "pull-quote" -> B.blockQuote <$> parseFromString parseBlocks body'
         "epigraph" -> B.blockQuote <$> parseFromString parseBlocks body'
         "highlights" -> B.blockQuote <$> parseFromString parseBlocks body'
-        "rubric" -> B.para . B.strong <$> parseFromString
-                          (trimInlines . mconcat <$> many inline) top
+        "rubric" -> B.para . B.strong <$> parseInlineFromString top
         _ | label `elem` ["attention","caution","danger","error","hint",
                           "important","note","tip","warning"] ->
-           do let tit = B.para $ B.strong $ B.str label
-              bod <- parseFromString parseBlocks $ top ++ "\n\n" ++ body'
-              return $ B.blockQuote $ tit <> bod
+           do bod <- parseFromString parseBlocks $ top ++ "\n\n" ++ body'
+              return $ B.divWith ("",["admonition", label],[]) bod
         "admonition" ->
-           do tit <- B.para . B.strong <$> parseFromString
-                          (trimInlines . mconcat <$> many inline) top
-              bod <- parseFromString parseBlocks body'
-              return $ B.blockQuote $ tit <> bod
+           do bod <- parseFromString parseBlocks $ top ++ "\n\n" ++ body'
+              return $ B.divWith ("",["admonition"],[]) bod
         "sidebar" ->
            do let subtit = maybe "" trim $ lookup "subtitle" fields
-              tit <- B.para . B.strong <$> parseFromString
-                          (trimInlines . mconcat <$> many inline)
+              tit <- B.para . B.strong <$> parseInlineFromString
                           (trim top ++ if null subtit
                                           then ""
                                           else (":  " ++ subtit))
               bod <- parseFromString parseBlocks body'
-              return $ B.blockQuote $ tit <> bod
+              return $ B.divWith ("",["sidebar"],[]) $ tit <> bod
         "topic" ->
-           do tit <- B.para . B.strong <$> parseFromString
-                          (trimInlines . mconcat <$> many inline) top
+           do tit <- B.para . B.strong <$> parseInlineFromString top
               bod <- parseFromString parseBlocks body'
-              return $ tit <> bod
+              return $ B.divWith ("",["topic"],[]) $ tit <> bod
         "default-role" -> mempty <$ updateState (\s ->
                               s { stateRstDefaultRole =
                                   case trim top of
                                      ""   -> stateRstDefaultRole def
                                      role -> role })
-        "code" -> codeblock (lookup "number-lines" fields) (trim top) body
-        "code-block" -> codeblock (lookup "number-lines" fields) (trim top) body
+        x | x == "code" || x == "code-block" ->
+          codeblock (words $ fromMaybe [] $ lookup "class" fields)
+                    (lookup "number-lines" fields) (trim top) body
         "aafig" -> do
           let attribs = ("", ["aafig"], map (\(k,v) -> (k, trimr v)) fields)
           return $ B.codeBlockWith attribs $ stripTrailingNewlines body
@@ -599,15 +595,16 @@ directive' = do
         "figure" -> do
            (caption, legend) <- parseFromString extractCaption body'
            let src = escapeURI $ trim top
-           return $ B.para (B.image src "fig:" caption) <> legend
+           return $ B.para (B.imageWith (imgAttr "figclass") src "fig:" caption) <> legend
         "image" -> do
            let src = escapeURI $ trim top
            let alt = B.str $ maybe "image" trim $ lookup "alt" fields
+           let attr = imgAttr "class"
            return $ B.para
                   $ case lookup "target" fields of
                           Just t  -> B.link (escapeURI $ trim t) ""
-                                     $ B.image src "" alt
-                          Nothing -> B.image src "" alt
+                                     $ B.imageWith attr src "" alt
+                          Nothing -> B.imageWith attr src "" alt
         "class" -> do
             let attrs = ("", (splitBy isSpace $ trim top), map (\(k,v) -> (k, trimr v)) fields)
             --  directive content or the first immediately following element
@@ -621,20 +618,22 @@ directive' = do
             return mempty
 
 -- TODO:
---  - Silently ignores illegal fields
 --  - Only supports :format: fields with a single format for :raw: roles,
 --    change Text.Pandoc.Definition.Format to fix
 addNewRole :: String -> [(String, String)] -> RSTParser Blocks
 addNewRole roleString fields = do
     (role, parentRole) <- parseFromString inheritedRole roleString
     customRoles <- stateRstCustomRoles <$> getState
-    let (baseRole, baseFmt, baseAttr) =
-            maybe (parentRole, Nothing, nullAttr) id $
-              M.lookup parentRole customRoles
+    let getBaseRole (r, f, a) roles =
+            case M.lookup r roles of
+                 Just (r', f', a') -> getBaseRole (r', f', a') roles
+                 Nothing -> (r, f, a)
+        (baseRole, baseFmt, baseAttr) =
+               getBaseRole (parentRole, Nothing, nullAttr) customRoles
         fmt = if parentRole == "raw" then lookup "format" fields else baseFmt
         annotate :: [String] -> [String]
         annotate = maybe id (:) $
-            if parentRole == "code"
+            if baseRole == "code"
                then lookup "language" fields
                else Nothing
         attr = let (ident, classes, keyValues) = baseAttr
@@ -643,12 +642,12 @@ addNewRole roleString fields = do
 
     -- warn about syntax we ignore
     flip mapM_ fields $ \(key, _) -> case key of
-        "language" -> when (parentRole /= "code") $ addWarning Nothing $
+        "language" -> when (baseRole /= "code") $ addWarning Nothing $
             "ignoring :language: field because the parent of role :" ++
-            role ++ ": is :" ++ parentRole ++ ": not :code:"
-        "format" -> when (parentRole /= "raw") $ addWarning Nothing $
+            role ++ ": is :" ++ baseRole ++ ": not :code:"
+        "format" -> when (baseRole /= "raw") $ addWarning Nothing $
             "ignoring :format: field because the parent of role :" ++
-            role ++ ": is :" ++ parentRole ++ ": not :raw:"
+            role ++ ": is :" ++ baseRole ++ ": not :raw:"
         _ -> addWarning Nothing $ "ignoring unknown field :" ++ key ++
              ": in definition of role :" ++ role ++ ": in"
     when (parentRole == "raw" && countKeys "format" > 1) $
@@ -713,12 +712,13 @@ toChunks = dropWhile null
            . map (trim . unlines)
            . splitBy (all (`elem` (" \t" :: String))) . lines
 
-codeblock :: Maybe String -> String -> String -> RSTParser Blocks
-codeblock numberLines lang body =
+codeblock :: [String] -> Maybe String -> String -> String -> RSTParser Blocks
+codeblock classes numberLines lang body =
   return $ B.codeBlockWith attribs $ stripTrailingNewlines body
-    where attribs = ("", classes, kvs)
-          classes = "sourceCode" : lang
+    where attribs = ("", classes', kvs)
+          classes' = "sourceCode" : lang
                     : maybe [] (\_ -> ["numberLines"]) numberLines
+                    ++ classes
           kvs     = case numberLines of
                           Just "" -> []
                           Nothing -> []
@@ -779,7 +779,7 @@ simpleReferenceName' :: Parser [Char] st String
 simpleReferenceName' = do
   x <- alphaNum
   xs <- many $  alphaNum
-            <|> (try $ oneOf "-_:+." >> lookAhead alphaNum)
+            <|> (try $ oneOf "-_:+." <* lookAhead alphaNum)
   return (x:xs)
 
 simpleReferenceName :: Parser [Char] st Inlines
@@ -819,10 +819,10 @@ substKey = try $ do
   res <- B.toList <$> directive'
   il <- case res of
              -- use alt unless :alt: attribute on image:
-             [Para [Image [Str "image"] (src,tit)]] ->
-                return $ B.image src tit alt
-             [Para [Link [Image [Str "image"] (src,tit)] (src',tit')]] ->
-                return $ B.link src' tit' (B.image src tit alt)
+             [Para [Image attr [Str "image"] (src,tit)]] ->
+                return $ B.imageWith attr src tit alt
+             [Para [Link _ [Image attr [Str "image"] (src,tit)] (src',tit')]] ->
+                return $ B.link src' tit' (B.imageWith attr src tit alt)
              [Para ils] -> return $ B.fromList ils
              _          -> mzero
   let key = toKey $ stripFirstAndLast ref
@@ -834,7 +834,8 @@ anonymousKey = try $ do
   src <- targetURI
   pos <- getPosition
   let key = toKey $ "_" ++ printf "%09d" (sourceLine pos)
-  updateState $ \s -> s { stateKeys = M.insert key (src,"") $ stateKeys s }
+  --TODO: parse width, height, class and name attributes
+  updateState $ \s -> s { stateKeys = M.insert key ((src,""), nullAttr) $ stateKeys s }
 
 stripTicks :: String -> String
 stripTicks = reverse . stripTick . reverse . stripTick
@@ -848,7 +849,8 @@ regularKey = try $ do
   char ':'
   src <- targetURI
   let key = toKey $ stripTicks ref
-  updateState $ \s -> s { stateKeys = M.insert key (src,"") $ stateKeys s }
+  --TODO: parse width, height, class and name attributes
+  updateState $ \s -> s { stateKeys = M.insert key ((src,""), nullAttr) $ stateKeys s }
 
 --
 -- tables
@@ -947,7 +949,8 @@ table = gridTable False <|> simpleTable False <|>
 --
 
 inline :: RSTParser Inlines
-inline = choice [ whitespace
+inline = choice [ note          -- can start with whitespace, so try before ws
+                , whitespace
                 , link
                 , str
                 , endline
@@ -956,11 +959,13 @@ inline = choice [ whitespace
                 , code
                 , subst
                 , interpretedRole
-                , note
                 , smart
                 , hyphens
                 , escapedChar
                 , symbol ] <?> "inline"
+
+parseInlineFromString :: String -> RSTParser Inlines
+parseInlineFromString = parseFromString (trimInlines . mconcat <$> many inline)
 
 hyphens :: RSTParser Inlines
 hyphens = do
@@ -1100,7 +1105,7 @@ endline = try $ do
      then notFollowedBy (anyOrderedListMarker >> spaceChar) >>
           notFollowedBy' bulletListStart
      else return ()
-  return B.space
+  return B.softbreak
 
 --
 -- links
@@ -1115,11 +1120,28 @@ explicitLink = try $ do
   notFollowedBy (char '`') -- `` marks start of inline code
   label' <- trimInlines . mconcat <$>
              manyTill (notFollowedBy (char '`') >> inline) (char '<')
-  src <- manyTill (noneOf ">\n") (char '>')
+  src <- trim <$> manyTill (noneOf ">\n") (char '>')
   skipSpaces
   string "`_"
   optional $ char '_' -- anonymous form
-  return $ B.link (escapeURI $ trim src) "" label'
+  let label'' = if label' == mempty
+                   then B.str src
+                   else label'
+  -- `link <google_>` is a reference link to _google!
+  (src',tit,attr) <- case reverse src of
+                          '_':xs -> do
+                            keyTable <- stateKeys <$> getState
+                            let key = toKey $ reverse xs
+                            case M.lookup key keyTable of
+                                 Nothing -> do
+                                   pos <- getPosition
+                                   addWarning (Just pos) $
+                                     "Could not find reference for " ++
+                                       show key
+                                   return ("","",nullAttr)
+                                 Just ((s,t),a) -> return (s,t,a)
+                          _ -> return (src, "", nullAttr)
+  return $ B.linkWith attr (escapeURI src') tit label''
 
 referenceLink :: RSTParser Inlines
 referenceLink = try $ do
@@ -1135,12 +1157,17 @@ referenceLink = try $ do
                    if null anonKeys
                       then mzero
                       else return (head anonKeys)
-  (src,tit) <- case M.lookup key keyTable of
-                    Nothing     -> fail "no corresponding key"
-                    Just target -> return target
+  ((src,tit), attr) <- case M.lookup key keyTable of
+                         Nothing  -> do
+                           pos <- getPosition
+                           addWarning (Just pos) $
+                             "Could not find reference for " ++
+                               show key
+                           return (("",""),nullAttr)
+                         Just val -> return val
   -- if anonymous link, remove key so it won't be used again
   when (isAnonKey key) $ updateState $ \s -> s{ stateKeys = M.delete key keyTable }
-  return $ B.link src tit label'
+  return $ B.linkWith attr src tit label'
 
 autoURI :: RSTParser Inlines
 autoURI = do
@@ -1160,18 +1187,28 @@ subst = try $ do
   (_,ref) <- withRaw $ enclosed (char '|') (char '|') inline
   state <- getState
   let substTable = stateSubstitutions state
-  case M.lookup (toKey $ stripFirstAndLast ref) substTable of
-       Nothing     -> fail "no corresponding key"
+  let key = toKey $ stripFirstAndLast ref
+  case M.lookup key substTable of
+       Nothing     -> do
+         pos <- getPosition
+         addWarning (Just pos) $
+           "Could not find reference for " ++ show key
+         return mempty
        Just target -> return target
 
 note :: RSTParser Inlines
 note = try $ do
+  optional whitespace
   ref <- noteMarker
   char '_'
   state <- getState
   let notes = stateNotes state
   case lookup ref notes of
-    Nothing   -> fail "note not found"
+    Nothing   -> do
+      pos <- getPosition
+      addWarning (Just pos) $
+        "Could not find note for " ++ show ref
+      return mempty
     Just raw  -> do
       -- We temporarily empty the note list while parsing the note,
       -- so that we don't get infinite loops with notes inside notes...

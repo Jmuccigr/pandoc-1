@@ -8,6 +8,7 @@ import Network.HTTP.Types.Status (status200)
 import Network.HTTP.Types.Header (hContentType)
 import Network.HTTP.Types.URI (queryToQueryText)
 import Text.Pandoc
+import Text.Pandoc.Error (PandocError)
 import Text.Pandoc.Shared (tabFilter)
 import Text.Highlighting.Kate (pygments)
 import Data.Aeson
@@ -29,8 +30,10 @@ app req respond = do
              $ lookup fromFormat fromFormats
   let writer = maybe (error $ "could not find writer for " ++ T.unpack toFormat) id
              $ lookup toFormat toFormats
-  let result = T.pack $ writer $ reader $ tabFilter 4 $ T.unpack text
-  let output = encode $ object [ T.pack "result" .= result
+  let result = case reader $ tabFilter 4 $ T.unpack text of
+                    Right doc -> T.pack $ writer doc
+                    Left  err -> error (show err)
+  let output = encode $ object [ T.pack "html" .= result
                                , T.pack "name" .=
                                   if fromFormat == "markdown_strict"
                                      then T.pack "pandoc (strict)"
@@ -55,7 +58,7 @@ readerOpts :: ReaderOptions
 readerOpts = def { readerParseRaw = True,
                    readerSmart = True }
 
-fromFormats :: [(Text, String -> Pandoc)]
+fromFormats :: [(Text, String -> Either PandocError Pandoc)]
 fromFormats = [
             ("native"       , readNative)
            ,("json"         , Text.Pandoc.readJSON readerOpts)

@@ -4,11 +4,9 @@ module Tests.Readers.LaTeX (tests) where
 import Text.Pandoc.Definition
 import Test.Framework
 import Tests.Helpers
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 import Text.Pandoc.Builder
 import Text.Pandoc
-import Data.Monoid (mempty)
-import Text.Pandoc.Error
 
 latex :: String -> Pandoc
 latex = handleError . readLaTeX def

@@ -4,12 +4,10 @@ module Tests.Readers.Txt2Tags (tests) where
 import Text.Pandoc.Definition
 import Test.Framework
 import Tests.Helpers
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 import Text.Pandoc.Builder
 import Text.Pandoc
-import Text.Pandoc.Error
 import Data.List (intersperse)
-import Data.Monoid (mempty, mconcat)
 import Text.Pandoc.Readers.Txt2Tags
 
 t2t :: String -> Pandoc
@@ -114,13 +112,13 @@ tests =
   , testGroup "Basic Blocks" $
       ["Paragraph, lines grouped together" =:
           "A paragraph\n A blank line ends the \n current paragraph\n"
-            =?> para "A paragraph A blank line ends the current paragraph"
+            =?> para "A paragraph\n A blank line ends the\n current paragraph"
       , "Paragraph, ignore leading and trailing spaces" =:
           "   Leading and trailing spaces are ignored.   \n" =?>
             para "Leading and trailing spaces are ignored."
       , "Comment line in paragraph" =:
           "A comment line can be placed inside a paragraph.\n% this comment will be ignored \nIt will not affect it.\n"
-          =?> para "A comment line can be placed inside a paragraph. It will not affect it."
+          =?> para "A comment line can be placed inside a paragraph.\nIt will not affect it."
       , "Paragraph" =:
           "Paragraph\n" =?>
           para "Paragraph"
@@ -168,7 +166,7 @@ tests =
           unlines [ "lucky"
                   , "*star"
                   ] =?>
-          para ("lucky" <> space <> "*star")
+          para ("lucky" <> softbreak <> "*star")
 
       , "Horizontal Rule" =:
           unlines [ "before"

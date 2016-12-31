@@ -17,13 +17,9 @@ Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 -}
 import Text.Pandoc
 import Criterion.Main
-import Criterion.Config
-import System.Environment (getArgs)
-import Data.Monoid
+import Criterion.Types (Config(..))
 import Data.Maybe (mapMaybe)
 import Debug.Trace (trace)
-import Text.Pandoc.Error
-import Control.Applicative
 
 readerBench :: Pandoc
             -> (String, ReaderOptions -> String -> IO (Either PandocError Pandoc))
@@ -31,7 +27,7 @@ readerBench :: Pandoc
 readerBench doc (name, reader) =
   case lookup name writers of
        Just (PureStringWriter writer) ->
-         let inp = writer def{ writerWrapText = True} doc
+         let inp = writer def{ writerWrapText = WrapAuto} doc
          in return $ bench (name ++ " reader") $ nfIO $
                  (fmap handleError <$> reader def{ readerSmart = True }) inp
        _ -> trace ("\nCould not find writer for " ++ name ++ "\n") Nothing
@@ -40,13 +36,10 @@ writerBench :: Pandoc
             -> (String, WriterOptions -> Pandoc -> String)
             -> Benchmark
 writerBench doc (name, writer) = bench (name ++ " writer") $ nf
-    (writer def{ writerWrapText = True }) doc
+    (writer def{ writerWrapText = WrapAuto }) doc
 
 main :: IO ()
 main = do
-  args <- getArgs
-  (conf,_) <- parseArgs defaultConfig{ cfgSamples = Last $ Just 20 }
-                        defaultOptions args
   inp <- readFile "tests/testsuite.txt"
   let opts = def{ readerSmart = True }
   let doc = handleError $ readMarkdown opts inp
@@ -56,5 +49,5 @@ main = do
   let writers' = [(n,w) | (n, PureStringWriter w) <- writers]
   let writerBs = map (writerBench doc)
                  $ writers'
-  defaultMainWith conf (return ()) $
-    writerBs ++ readerBs
+  defaultMainWith defaultConfig{ timeLimit = 6.0 }
+    (writerBs ++ readerBs)

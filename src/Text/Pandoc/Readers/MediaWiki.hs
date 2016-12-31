@@ -38,21 +38,21 @@ module Text.Pandoc.Readers.MediaWiki ( readMediaWiki ) where
 
 import Text.Pandoc.Definition
 import qualified Text.Pandoc.Builder as B
-import Text.Pandoc.Builder (Inlines, Blocks, trimInlines, (<>))
+import Text.Pandoc.Builder (Inlines, Blocks, trimInlines)
+import Data.Monoid ((<>))
 import Text.Pandoc.Options
 import Text.Pandoc.Readers.HTML ( htmlTag, isBlockTag, isCommentTag )
 import Text.Pandoc.XML ( fromEntities )
 import Text.Pandoc.Parsing hiding ( nested )
 import Text.Pandoc.Walk ( walk )
 import Text.Pandoc.Shared ( stripTrailingNewlines, safeRead, stringify, trim )
-import Data.Monoid (mconcat, mempty)
-import Control.Applicative ((<$>), (<*), (*>), (<$))
 import Control.Monad
 import Data.List (intersperse, intercalate, isPrefixOf )
 import Text.HTML.TagSoup
 import Data.Sequence (viewl, ViewL(..), (<|))
 import qualified Data.Foldable as F
 import qualified Data.Map as M
+import qualified Data.Set as Set
 import Data.Char (isDigit, isSpace)
 import Data.Maybe (fromMaybe)
 import Text.Printf (printf)
@@ -70,7 +70,7 @@ readMediaWiki opts s =
                                        , mwNextLinkNumber  = 1
                                        , mwCategoryLinks = []
                                        , mwHeaderMap = M.empty
-                                       , mwIdentifierList = []
+                                       , mwIdentifierList = Set.empty
                                        }
            (s ++ "\n")
 
@@ -79,7 +79,7 @@ data MWState = MWState { mwOptions         :: ReaderOptions
                        , mwNextLinkNumber  :: Int
                        , mwCategoryLinks   :: [Inlines]
                        , mwHeaderMap       :: M.Map Inlines String
-                       , mwIdentifierList  :: [String]
+                       , mwIdentifierList  :: Set.Set String
                        }
 
 type MWParser = Parser [Char] MWState
@@ -225,7 +225,7 @@ table = do
                          Nothing -> 1.0
   caption <- option mempty tableCaption
   optional rowsep
-  hasheader <- option False $ True <$ (lookAhead (char '!'))
+  hasheader <- option False $ True <$ (lookAhead (skipSpaces *> char '!'))
   (cellspecs',hdr) <- unzip <$> tableRow
   let widths = map ((tableWidth *) . snd) cellspecs'
   let restwidth = tableWidth - sum widths
@@ -252,8 +252,8 @@ parseAttr = try $ do
   skipMany spaceChar
   k <- many1 letter
   char '='
-  char '"'
-  v <- many1Till (satisfy (/='\n')) (char '"')
+  v <- (char '"' >> many1Till (satisfy (/='\n')) (char '"'))
+       <|> many1 (satisfy $ \c -> not (isSpace c) && c /= '|')
   return (k,v)
 
 tableStart :: MWParser ()
@@ -371,14 +371,22 @@ preformatted = try $ do
                    manyTill anyChar (htmlTag (~== TagClose "nowiki")))
   let inline' = whitespace' <|> endline' <|> nowiki'
                   <|> (try $ notFollowedBy newline *> inline)
-  let strToCode (Str s) = Code ("",[],[]) s
-      strToCode  x      = x
   contents <- mconcat <$> many1 inline'
   let spacesStr (Str xs) = all isSpace xs
       spacesStr _        = False
   if F.all spacesStr contents
      then return mempty
-     else return $ B.para $ walk strToCode contents
+     else return $ B.para $ encode contents
+
+encode :: Inlines -> Inlines
+encode = B.fromList . normalizeCode . B.toList . walk strToCode
+  where strToCode (Str s) = Code ("",[],[]) s
+        strToCode Space   = Code ("",[],[]) " "
+        strToCode  x      = x
+        normalizeCode []  = []
+        normalizeCode (Code a1 x : Code a2 y : zs) | a1 == a2 =
+          normalizeCode $ (Code a1 (x ++ y)) : zs
+        normalizeCode (x:xs) = x : normalizeCode xs
 
 header :: MWParser Blocks
 header = try $ do
@@ -543,8 +551,8 @@ inlineTag = do
        TagOpen "del" _ -> B.strikeout <$> inlinesInTags "del"
        TagOpen "sub" _ -> B.subscript <$> inlinesInTags "sub"
        TagOpen "sup" _ -> B.superscript <$> inlinesInTags "sup"
-       TagOpen "code" _ -> B.code <$> charsInTags "code"
-       TagOpen "tt" _ -> B.code <$> charsInTags "tt"
+       TagOpen "code" _ -> encode <$> inlinesInTags "code"
+       TagOpen "tt" _ -> encode <$> inlinesInTags "tt"
        TagOpen "hask" _ -> B.codeWith ("",["haskell"],[]) <$> charsInTags "hask"
        _ -> B.rawInline "html" . snd <$> htmlTag (~== tag)
 
@@ -556,7 +564,8 @@ inlineHtml :: MWParser Inlines
 inlineHtml = B.rawInline "html" . snd <$> htmlTag isInlineTag'
 
 whitespace :: MWParser Inlines
-whitespace = B.space <$ (skipMany1 spaceChar <|> endline <|> htmlComment)
+whitespace = B.space <$ (skipMany1 spaceChar <|> htmlComment)
+         <|> B.softbreak <$ endline
 
 endline :: MWParser ()
 endline = () <$ try (newline <*
@@ -576,22 +585,30 @@ image :: MWParser Inlines
 image = try $ do
   sym "[["
   choice imageIdentifiers
-  fname <- many1 (noneOf "|]")
-  _ <- many (try $ char '|' *> imageOption)
+  fname <- addUnderscores <$> many1 (noneOf "|]")
+  _ <- many imageOption
+  dims <- try (char '|' *> (sepBy (many digit) (char 'x')) <* string "px")
+          <|> return []
+  _ <- many imageOption
+  let kvs = case dims of
+              w:[]     -> [("width", w)]
+              w:(h:[]) -> [("width", w), ("height", h)]
+              _        -> []
+  let attr = ("", [], kvs)
   caption <-   (B.str fname <$ sym "]]")
            <|> try (char '|' *> (mconcat <$> manyTill inline (sym "]]")))
-  return $ B.image fname ("fig:" ++ stringify caption) caption
+  return $ B.imageWith attr fname ("fig:" ++ stringify caption) caption
 
 imageOption :: MWParser String
-imageOption =
-      try (oneOfStrings [ "border", "thumbnail", "frameless"
-                        , "thumb", "upright", "left", "right"
-                        , "center", "none", "baseline", "sub"
-                        , "super", "top", "text-top", "middle"
-                        , "bottom", "text-bottom" ])
-  <|> try (string "frame")
-  <|> try (many1 (oneOf "x0123456789") <* string "px")
-  <|> try (oneOfStrings ["link=","alt=","page=","class="] <* many (noneOf "|]"))
+imageOption = try $ char '|' *> opt
+  where
+    opt = try (oneOfStrings [ "border", "thumbnail", "frameless"
+                            , "thumb", "upright", "left", "right"
+                            , "center", "none", "baseline", "sub"
+                            , "super", "top", "text-top", "middle"
+                            , "bottom", "text-bottom" ])
+      <|> try (string "frame")
+      <|> try (oneOfStrings ["link=","alt=","page=","class="] <* many (noneOf "|]"))
 
 collapseUnderscores :: String -> String
 collapseUnderscores [] = []

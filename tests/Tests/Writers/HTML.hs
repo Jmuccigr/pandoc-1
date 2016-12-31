@@ -5,10 +5,10 @@ import Test.Framework
 import Text.Pandoc.Builder
 import Text.Pandoc
 import Tests.Helpers
-import Tests.Arbitrary()
+import Text.Pandoc.Arbitrary()
 
-html :: (ToString a, ToPandoc a) => a -> String
-html = writeHtmlString def{ writerWrapText = False } . toPandoc
+html :: (ToPandoc a) => a -> String
+html = writeHtmlString def{ writerWrapText = WrapNone } . toPandoc
 
 {-
   "my test" =: X =?> Y

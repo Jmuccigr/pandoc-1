@@ -10,37 +10,38 @@ module Text.Pandoc.Readers.EPUB
 
 import Text.XML.Light
 import Text.Pandoc.Definition hiding (Attr)
-import Text.Pandoc.Walk (walk, query)
 import Text.Pandoc.Readers.HTML (readHtml)
+import Text.Pandoc.Error
+import Text.Pandoc.Walk (walk, query)
 import Text.Pandoc.Options ( ReaderOptions(..), readerTrace)
 import Text.Pandoc.Shared (escapeURI, collapseFilePath, addMetaField)
+import Network.URI (unEscapeString)
 import Text.Pandoc.MediaBag (MediaBag, insertMedia)
-import Text.Pandoc.Compat.Except (MonadError, throwError, runExcept, Except)
+import Control.Monad.Except (MonadError, throwError, runExcept, Except)
 import Text.Pandoc.MIME (MimeType)
 import qualified Text.Pandoc.Builder as B
-import Codec.Archive.Zip ( Archive (..), toArchive, fromEntry
+import Codec.Archive.Zip ( Archive (..), toArchiveOrFail, fromEntry
                          , findEntryByPath, Entry)
 import qualified Data.ByteString.Lazy as BL (ByteString)
 import System.FilePath ( takeFileName, (</>), dropFileName, normalise
                        , dropFileName
                        , splitFileName )
 import qualified Text.Pandoc.UTF8 as UTF8 (toStringLazy)
-import Control.Applicative ((<$>))
 import Control.Monad (guard, liftM, when)
-import Data.Monoid (mempty, (<>))
 import Data.List (isPrefixOf, isInfixOf)
 import Data.Maybe (mapMaybe, fromMaybe)
 import qualified Data.Map as M (Map, lookup, fromList, elems)
-import Control.DeepSeq.Generics (deepseq, NFData)
+import Data.Monoid ((<>))
+import Control.DeepSeq (deepseq, NFData)
 
 import Debug.Trace (trace)
-
-import Text.Pandoc.Error
 
 type Items = M.Map String (FilePath, MimeType)
 
 readEPUB :: ReaderOptions -> BL.ByteString -> Either PandocError (Pandoc, MediaBag)
-readEPUB opts bytes = runEPUB (archiveToEPUB opts $ toArchive bytes)
+readEPUB opts bytes = case toArchiveOrFail bytes of
+  Right archive -> runEPUB $ archiveToEPUB opts $ archive
+  Left  _       -> Left $ ParseFailure "Couldn't extract ePub file"
 
 runEPUB :: Except PandocError a -> Either PandocError a
 runEPUB = runExcept
@@ -73,14 +74,15 @@ archiveToEPUB os archive = do
       let docSpan = B.doc $ B.para $ B.spanWith (takeFileName path, [], []) mempty
       return $ docSpan <> doc
     mimeToReader :: MonadError PandocError m => MimeType -> FilePath -> FilePath -> m Pandoc
-    mimeToReader "application/xhtml+xml" (normalise -> root) (normalise -> path) = do
+    mimeToReader "application/xhtml+xml" (unEscapeString -> root)
+                                         (unEscapeString -> path) = do
       fname <- findEntryByPathE (root </> path) archive
       html <- either throwError return .
                 readHtml os' .
                   UTF8.toStringLazy $
                     fromEntry fname
       return $ fixInternalReferences path html
-    mimeToReader s _ path
+    mimeToReader s _ (unEscapeString -> path)
       | s `elem` imageMimes = return $ imageToPandoc path
       | otherwise = return $ mempty
 
@@ -101,12 +103,14 @@ fetchImages mimes root arc (query iq -> links) =
           <$> findEntryByPath abslink arc
 
 iq :: Inline -> [FilePath]
-iq (Image _ (url, _)) = [url]
+iq (Image _ _ (url, _)) = [url]
 iq _ = []
 
 -- Remove relative paths
 renameImages :: FilePath -> Inline -> Inline
-renameImages root (Image a (url, b)) = Image a (collapseFilePath (root </> url), b)
+renameImages root img@(Image attr a (url, b))
+  | "data:" `isPrefixOf` url = img
+  | otherwise                = Image attr a (collapseFilePath (root </> url), b)
 renameImages _ x = x
 
 imageToPandoc :: FilePath -> Pandoc
@@ -181,7 +185,6 @@ getManifest archive = do
 fixInternalReferences :: FilePath -> Pandoc -> Pandoc
 fixInternalReferences pathToFile =
   (walk $ renameImages root)
-  . (walk normalisePath)
   . (walk $ fixBlockIRs filename)
   . (walk $ fixInlineIRs filename)
   where
@@ -192,20 +195,16 @@ fixInlineIRs s (Span as v) =
   Span (fixAttrs s as) v
 fixInlineIRs s (Code as code) =
   Code (fixAttrs s as) code
-fixInlineIRs s (Link t ('#':url, tit)) =
-  Link t (addHash s url, tit)
+fixInlineIRs s (Link as is ('#':url, tit)) =
+  Link (fixAttrs s as) is (addHash s url, tit)
+fixInlineIRs s (Link as is t) =
+  Link (fixAttrs s as) is t
 fixInlineIRs _ v = v
 
-normalisePath :: Inline -> Inline
-normalisePath (Link t (url, tit)) =
-  let (path, uid) = span (/= '#') url in
-  Link t (takeFileName path ++ uid, tit)
-normalisePath s = s
-
 prependHash :: [String] -> Inline -> Inline
-prependHash ps l@(Link is (url, tit))
+prependHash ps l@(Link attr is (url, tit))
   | or [s `isPrefixOf` url | s <- ps] =
-    Link is ('#':url, tit)
+    Link attr is ('#':url, tit)
   | otherwise = l
 prependHash _ i = i
 
@@ -223,7 +222,7 @@ fixAttrs s (ident, cs, kvs) = (addHash s ident, filter (not . null) cs, removeEP
 
 addHash :: String -> String -> String
 addHash _ "" = ""
-addHash s ident = s ++ "#" ++ ident
+addHash s ident = takeFileName s ++ "#" ++ ident
 
 removeEPUBAttrs :: [(String, String)] -> [(String, String)]
 removeEPUBAttrs kvs = filter (not . isEPUBAttr) kvs

@@ -141,7 +141,7 @@ Nother paragraph.
 
 [http://google.com ''Google'' search engine]
 
-http://johnmacfarlane.net/pandoc/
+http://pandoc.org
 
 [http://google.com] [http://yahoo.com]
 
@@ -170,6 +170,10 @@ http://johnmacfarlane.net/pandoc/
 [[File:example.jpg|border|the ''caption'' with [http://google.com external link]]]
 
 [[File:example.jpg|frameless|border|30x40px|caption]]
+
+[[File:example.jpg|frameless|border|30px|caption]]
+
+[[File:example.jpg|page=4|30px|border|caption]]
 
 [[File:example.jpg]]
 
@@ -344,7 +348,7 @@ and cheese
 |   Butter   || Ice cream ||  and more
 |}
 
-{|width="50%"
+{|width=50%
 ! align="left" width="50%"| Left
 ! align="right"|Right
 ! align="center"|Center
@@ -376,6 +380,14 @@ and cheese
 {|
 |Orange
 |}Paragraph after the table.
+
+{|
+ !fruit
+ !topping
+ |-
+ |apple
+ |ice cream
+ |}
 
 == notes ==
 

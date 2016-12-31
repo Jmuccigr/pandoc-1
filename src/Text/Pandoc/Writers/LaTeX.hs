@@ -38,14 +38,18 @@ import Text.Pandoc.Options
 import Text.Pandoc.Templates
 import Text.Printf ( printf )
 import Network.URI ( isURI, unEscapeString )
-import Data.List ( (\\), isSuffixOf, isInfixOf, stripPrefix,
-                   isPrefixOf, intercalate, intersperse )
-import Data.Char ( toLower, isPunctuation, isAscii, isLetter, isDigit, ord )
-import Data.Maybe ( fromMaybe )
-import Data.Aeson.Types ( (.:), parseMaybe, withObject )
+import Data.Aeson (object, (.=), FromJSON)
+import Data.List ( (\\), isInfixOf, stripPrefix, intercalate, intersperse,
+                   nub, nubBy, foldl' )
+import Data.Char ( toLower, isPunctuation, isAscii, isLetter, isDigit,
+                   ord, isAlphaNum )
+import Data.Maybe ( fromMaybe, isJust, catMaybes )
+import qualified Data.Text as T
 import Control.Applicative ((<|>))
 import Control.Monad.State
+import qualified Text.Parsec as P
 import Text.Pandoc.Pretty
+import Text.Pandoc.ImageSize
 import Text.Pandoc.Slides
 import Text.Pandoc.Highlighting (highlight, styleToLaTeX,
                                  formatLaTeXInline, formatLaTeXBlock,
@@ -83,7 +87,11 @@ writeLaTeX options document =
                 stOptions = options, stVerbInNote = False,
                 stTable = False, stStrikeout = False,
                 stUrl = False, stGraphics = False,
-                stLHS = False, stBook = writerChapters options,
+                stLHS = False,
+                stBook = (case writerTopLevelDivision options of
+                           TopLevelPart    -> True
+                           TopLevelChapter -> True
+                           _               -> False),
                 stCsquotes = False, stHighlighting = False,
                 stIncremental = writerIncremental options,
                 stInternalLinks = [], stUsesEuro = False }
@@ -98,12 +106,12 @@ pandocToLaTeX options (Pandoc meta blocks) = do
                              _ -> blocks
                    else blocks
   -- see if there are internal links
-  let isInternalLink (Link _ ('#':xs,_))  = [xs]
-      isInternalLink _                    = []
+  let isInternalLink (Link _ _ ('#':xs,_))  = [xs]
+      isInternalLink _                      = []
   modify $ \s -> s{ stInternalLinks = query isInternalLink blocks' }
-  let template = writerTemplate options
+  let template = maybe "" id $ writerTemplate options
   -- set stBook depending on documentclass
-  let colwidth = if writerWrapText options
+  let colwidth = if writerWrapText options == WrapAuto
                     then Just $ writerColumns options
                     else Nothing
   metadata <- metaToJSON options
@@ -111,17 +119,24 @@ pandocToLaTeX options (Pandoc meta blocks) = do
               (fmap (render colwidth) . inlineListToLaTeX)
               meta
   let bookClasses = ["memoir","book","report","scrreprt","scrbook"]
+  let documentClass = case P.parse pDocumentClass "template" template of
+                              Right r -> r
+                              Left _  -> ""
   case lookup "documentclass" (writerVariables options) `mplus`
-        parseMaybe (withObject "object" (.: "documentclass")) metadata of
+        fmap stringify (lookupMeta "documentclass" meta) of
          Just x  | x `elem` bookClasses -> modify $ \s -> s{stBook = True}
                  | otherwise            -> return ()
-         Nothing | any (\x -> "\\documentclass" `isPrefixOf` x &&
-                          (any (`isSuffixOf` x) bookClasses))
-                          (lines template) -> modify $ \s -> s{stBook = True}
+         Nothing | documentClass `elem` bookClasses
+                                        -> modify $ \s -> s{stBook = True}
                  | otherwise               -> return ()
   -- check for \usepackage...{csquotes}; if present, we'll use
   -- \enquote{...} for smart quotes:
-  when ("{csquotes}" `isInfixOf` template) $
+  let headerIncludesField :: FromJSON a => Maybe a
+      headerIncludesField = getField "header-includes" metadata
+  let headerIncludes = fromMaybe [] $ mplus
+                       (fmap return headerIncludesField)
+                       headerIncludesField
+  when (any (isInfixOf "{csquotes}") (template : headerIncludes)) $
     modify $ \s -> s{stCsquotes = True}
   let (blocks'', lastHeader) = if writerCiteMethod options == Citeproc then
                                  (blocks', [])
@@ -137,6 +152,16 @@ pandocToLaTeX options (Pandoc meta blocks) = do
   st <- get
   titleMeta <- stringToLaTeX TextString $ stringify $ docTitle meta
   authorsMeta <- mapM (stringToLaTeX TextString . stringify) $ docAuthors meta
+  let docLangs = nub $ query (extract "lang") blocks
+  let hasStringValue x = isJust (getField x metadata :: Maybe String)
+  let geometryFromMargins = intercalate [','] $ catMaybes $
+                              map (\(x,y) ->
+                                ((x ++ "=") ++) <$> getField y metadata)
+                              [("lmargin","margin-left")
+                              ,("rmargin","margin-right")
+                              ,("tmargin","margin-top")
+                              ,("bmargin","margin-bottom")
+                              ]
   let context  =  defField "toc" (writerTableOfContents options) $
                   defField "toc-depth" (show (writerTOCDepth options -
                                               if stBook st
@@ -161,8 +186,6 @@ pandocToLaTeX options (Pandoc meta blocks) = do
                   defField "euro" (stUsesEuro st) $
                   defField "listings" (writerListings options || stLHS st) $
                   defField "beamer" (writerBeamer options) $
-                  defField "mainlang" (maybe "" (reverse . takeWhile (/=',') . reverse)
-                                (lookup "lang" $ writerVariables options)) $
                   (if stHighlighting st
                       then defField "highlighting-macros" (styleToLaTeX
                                 $ writerHighlightStyle options )
@@ -173,10 +196,59 @@ pandocToLaTeX options (Pandoc meta blocks) = do
                          Biblatex -> defField "biblio-title" biblioTitle .
                                      defField "biblatex" True
                          _        -> id) $
+                  -- set lang to something so polyglossia/babel is included
+                  defField "lang" (if null docLangs then ""::String else "en") $
+                  defField "otherlangs" docLangs $
+                  defField "colorlinks" (any hasStringValue
+                           ["citecolor", "urlcolor", "linkcolor", "toccolor"]) $
+                  defField "dir" (if (null $ query (extract "dir") blocks)
+                                     then ""::String
+                                     else "ltr") $
+                  defField "section-titles" True $
+                  defField "geometry" geometryFromMargins $
                   metadata
-  return $ if writerStandalone options
-              then renderTemplate' template context
-              else main
+  let toPolyObj lang = object [ "name"    .= T.pack name
+                              , "options" .= T.pack opts ]
+        where
+          (name, opts) = toPolyglossia lang
+  let lang = maybe [] (splitBy (=='-')) $ getField "lang" context
+      otherlangs = maybe [] (map $ splitBy (=='-')) $ getField "otherlangs" context
+  let context' =
+          defField "babel-lang" (toBabel lang)
+        $ defField "babel-otherlangs" (map toBabel otherlangs)
+        $ defField "babel-newcommands" (concatMap (\(poly, babel) ->
+            -- \textspanish and \textgalician are already used by babel
+            -- save them as \oritext... and let babel use that
+            if poly `elem` ["spanish", "galician"]
+               then "\\let\\oritext" ++ poly ++ "\\text" ++ poly ++ "\n" ++
+                    "\\AddBabelHook{" ++ poly ++ "}{beforeextras}" ++
+                      "{\\renewcommand{\\text" ++ poly ++ "}{\\oritext"
+                      ++ poly ++ "}}\n" ++
+                    "\\AddBabelHook{" ++ poly ++ "}{afterextras}" ++
+                      "{\\renewcommand{\\text" ++ poly ++ "}[2][]{\\foreignlanguage{"
+                      ++ poly ++ "}{##2}}}\n"
+               else "\\newcommand{\\text" ++ poly ++ "}[2][]{\\foreignlanguage{"
+                      ++ babel ++ "}{#2}}\n" ++
+                    "\\newenvironment{" ++ poly ++ "}[2][]{\\begin{otherlanguage}{"
+                      ++ babel ++ "}}{\\end{otherlanguage}}\n"
+            )
+            -- eliminate duplicates that have same polyglossia name
+            $ nubBy (\a b -> fst a == fst b)
+            -- find polyglossia and babel names of languages used in the document
+            $ map (\l ->
+              let lng = splitBy (=='-') l
+              in  (fst $ toPolyglossia lng, toBabel lng)
+              )
+            docLangs )
+        $ defField "polyglossia-lang" (toPolyObj lang)
+        $ defField "polyglossia-otherlangs" (map toPolyObj otherlangs)
+        $ defField "latex-dir-rtl" (case (getField "dir" context)::Maybe String of
+                                      Just "rtl" -> True
+                                      _          -> False)
+        $ context
+  return $ case writerTemplate options of
+                Nothing  -> main
+                Just tpl -> renderTemplate' tpl context'
 
 -- | Convert Elements to LaTeX
 elementToLaTeX :: WriterOptions -> Element -> State WriterState Doc
@@ -208,6 +280,7 @@ stringToLaTeX  ctx (x:xs) = do
        '€' -> "\\euro{}" ++ rest
        '{' -> "\\{" ++ rest
        '}' -> "\\}" ++ rest
+       '`' | ctx == CodeString -> "\\textasciigrave{}" ++ rest
        '$' | not isUrl -> "\\$" ++ rest
        '%' -> "\\%" ++ rest
        '&' -> "\\&" ++ rest
@@ -221,13 +294,14 @@ stringToLaTeX  ctx (x:xs) = do
        '^' -> "\\^{}" ++ rest
        '\\'| isUrl     -> '/' : rest  -- NB. / works as path sep even on Windows
            | otherwise -> "\\textbackslash{}" ++ rest
-       '|' -> "\\textbar{}" ++ rest
+       '|' | not isUrl -> "\\textbar{}" ++ rest
        '<' -> "\\textless{}" ++ rest
        '>' -> "\\textgreater{}" ++ rest
        '[' -> "{[}" ++ rest  -- to avoid interpretation as
        ']' -> "{]}" ++ rest  -- optional arguments
        '\'' | ctx == CodeString -> "\\textquotesingle{}" ++ rest
        '\160' -> "~" ++ rest
+       '\x202F' -> "\\," ++ rest
        '\x2026' -> "\\ldots{}" ++ rest
        '\x2018' | ligatures -> "`" ++ rest
        '\x2019' | ligatures -> "'" ++ rest
@@ -242,7 +316,7 @@ toLabel z = go `fmap` stringToLaTeX URLString z
  where go [] = ""
        go (x:xs)
          | (isLetter x || isDigit x) && isAscii x = x:go xs
-         | elem x ("-+=:;." :: String) = x:go xs
+         | elem x ("_-+=:;." :: String) = x:go xs
          | otherwise = "ux" ++ printf "%x" (ord x) ++ go xs
 
 -- | Puts contents into LaTeX command.
@@ -273,14 +347,14 @@ elementToBeamer slideLevel  (Sec lvl _num (ident,classes,kvs) tit elts)
           hasCodeBlock _               = []
       let hasCode (Code _ _) = [True]
           hasCode _          = []
-      opts <- gets stOptions
-      let fragile = not $ null $ query hasCodeBlock elts ++
-                                     if writerListings opts
-                                        then query hasCode elts
-                                        else []
-      let allowframebreaks = "allowframebreaks" `elem` classes
+      let fragile = "fragile" `elem` classes ||
+                    not (null $ query hasCodeBlock elts ++ query hasCode elts)
+      let frameoptions = ["allowdisplaybreaks", "allowframebreaks",
+                          "b", "c", "t", "environment",
+                          "label", "plain", "shrink", "standout"]
       let optionslist = ["fragile" | fragile] ++
-                        ["allowframebreaks" | allowframebreaks]
+                        [k | k <- classes, k `elem` frameoptions] ++
+                        [k ++ "=" ++ v | (k,v) <- kvs, k `elem` frameoptions]
       let options = if null optionslist
                        then ""
                        else "[" ++ intercalate "," optionslist ++ "]"
@@ -301,6 +375,7 @@ isListBlock _                  = False
 
 isLineBreakOrSpace :: Inline -> Bool
 isLineBreakOrSpace LineBreak = True
+isLineBreakOrSpace SoftBreak = True
 isLineBreakOrSpace Space = True
 isLineBreakOrSpace _ = False
 
@@ -308,29 +383,56 @@ isLineBreakOrSpace _ = False
 blockToLaTeX :: Block     -- ^ Block to convert
              -> State WriterState Doc
 blockToLaTeX Null = return empty
-blockToLaTeX (Div (identifier,classes,_) bs) = do
+blockToLaTeX (Div (identifier,classes,kvs) bs) = do
   beamer <- writerBeamer `fmap` gets stOptions
   ref <- toLabel identifier
   let linkAnchor = if null identifier
                       then empty
-                      else "\\hyperdef{}" <> braces (text ref) <>
-                           braces ("\\label" <> braces (text ref))
-  contents <- blockListToLaTeX bs
-  if beamer && "notes" `elem` classes  -- speaker notes
-     then return $ "\\note" <> braces contents
-     else return (linkAnchor $$ contents)
+                      else "\\hypertarget" <> braces (text ref) <>
+                             braces empty
+  let align dir txt = inCmd "begin" dir $$ txt $$ inCmd "end" dir
+  let wrapDir = case lookup "dir" kvs of
+                  Just "rtl" -> align "RTL"
+                  Just "ltr" -> align "LTR"
+                  _          -> id
+      wrapLang txt = case lookup "lang" kvs of
+                       Just lng -> let (l, o) = toPolyglossiaEnv lng
+                                       ops = if null o
+                                                then ""
+                                                else brackets $ text o
+                                   in  inCmd "begin" (text l) <> ops
+                                       $$ blankline <> txt <> blankline
+                                       $$ inCmd "end" (text l)
+                       Nothing  -> txt
+      wrapNotes txt = if beamer && "notes" `elem` classes
+                          then "\\note" <> braces txt -- speaker notes
+                          else linkAnchor $$ txt
+  fmap (wrapDir . wrapLang . wrapNotes) $ blockListToLaTeX bs
 blockToLaTeX (Plain lst) =
   inlineListToLaTeX $ dropWhile isLineBreakOrSpace lst
 -- title beginning with fig: indicates that the image is a figure
-blockToLaTeX (Para [Image txt (src,'f':'i':'g':':':tit)]) = do
+blockToLaTeX (Para [Image attr@(ident, _, _) txt (src,'f':'i':'g':':':tit)]) = do
   inNote <- gets stInNote
+  modify $ \st -> st{ stInMinipage = True, stNotes = [] }
   capt <- inlineListToLaTeX txt
-  img <- inlineToLaTeX (Image txt (src,tit))
+  notes <- gets stNotes
+  modify $ \st -> st{ stInMinipage = False, stNotes = [] }
+
+  -- We can't have footnotes in the list of figures, so remove them:
+  captForLof <- if null notes
+                   then return empty
+                   else brackets <$> inlineListToLaTeX (walk deNote txt)
+  img <- inlineToLaTeX (Image attr txt (src,tit))
+  let footnotes = notesToLaTeX notes
+  lab <- labelFor ident
+  let caption = "\\caption" <> captForLof <> braces capt <> lab
+  figure <- hypertarget ident (cr <>
+            "\\begin{figure}" $$ "\\centering" $$ img $$
+            caption $$ "\\end{figure}" <> cr)
   return $ if inNote
               -- can't have figures in notes
               then "\\begin{center}" $$ img $+$ capt $$ "\\end{center}"
-              else "\\begin{figure}[htbp]" $$ "\\centering" $$ img $$
-                      ("\\caption" <> braces capt) $$ "\\end{figure}"
+              else figure $$ footnotes
 -- . . . indicates pause in beamer slides
 blockToLaTeX (Para [Str ".",Space,Str ".",Space,Str "."]) = do
   beamer <- writerBeamer `fmap` gets stOptions
@@ -339,6 +441,8 @@ blockToLaTeX (Para [Str ".",Space,Str ".",Space,Str "."]) = do
      else inlineListToLaTeX [Str ".",Space,Str ".",Space,Str "."]
 blockToLaTeX (Para lst) =
   inlineListToLaTeX $ dropWhile isLineBreakOrSpace lst
+blockToLaTeX (LineBlock lns) = do
+  blockToLaTeX $ linesToPara lns
 blockToLaTeX (BlockQuote lst) = do
   beamer <- writerBeamer `fmap` gets stOptions
   case lst of
@@ -359,7 +463,7 @@ blockToLaTeX (CodeBlock (identifier,classes,keyvalAttr) str) = do
   ref <- toLabel identifier
   let linkAnchor = if null identifier
                       then empty
-                      else "\\hyperdef{}" <> braces (text ref) <>
+                      else "\\hypertarget" <> braces (text ref) <>
                                 braces ("\\label" <> braces (text ref))
   let lhsCodeBlock = do
         modify $ \s -> s{ stLHS = True }
@@ -377,30 +481,34 @@ blockToLaTeX (CodeBlock (identifier,classes,keyvalAttr) str) = do
         st <- get
         let params = if writerListings (stOptions st)
                      then (case getListingsLanguage classes of
-                                Just l  -> [ "language=" ++ l ]
+                                Just l  -> [ "language=" ++ mbBraced l ]
                                 Nothing -> []) ++
                           [ "numbers=left" | "numberLines" `elem` classes
                              || "number" `elem` classes
                              || "number-lines" `elem` classes ] ++
                           [ (if key == "startFrom"
                                 then "firstnumber"
-                                else key) ++ "=" ++ attr |
+                                else key) ++ "=" ++ mbBraced attr |
                                 (key,attr) <- keyvalAttr ] ++
                           (if identifier == ""
                                 then []
                                 else [ "label=" ++ ref ])
 
                      else []
+            mbBraced x = if not (all isAlphaNum x)
+                            then "{" <> x <> "}"
+                            else x
             printParams
                 | null params = empty
-                | otherwise   = brackets $ hcat (intersperse ", " (map text params))
+                | otherwise   = brackets $ hcat (intersperse ", "
+                      (map text params))
         return $ flush ("\\begin{lstlisting}" <> printParams $$ text str $$
                  "\\end{lstlisting}") $$ cr
   let highlightedCodeBlock =
         case highlight formatLaTeXBlock ("",classes,keyvalAttr) str of
                Nothing -> rawCodeBlock
                Just  h -> modify (\st -> st{ stHighlighting = True }) >>
-                          return (flush $ linkAnchor $$ text h)
+                          return (flush $ linkAnchor $$ text (T.unpack h))
   case () of
      _ | isEnabled Ext_literate_haskell opts && "haskell" `elem` classes &&
          "literate" `elem` classes                      -> lhsCodeBlock
@@ -414,7 +522,8 @@ blockToLaTeX (RawBlock f x)
 blockToLaTeX (BulletList []) = return empty  -- otherwise latex error
 blockToLaTeX (BulletList lst) = do
   incremental <- gets stIncremental
-  let inc = if incremental then "[<+->]" else ""
+  beamer <- writerBeamer `fmap` gets stOptions
+  let inc = if beamer && incremental then "[<+->]" else ""
   items <- mapM listItemToLaTeX lst
   let spacing = if isTightList lst
                    then text "\\tightlist"
@@ -480,26 +589,29 @@ blockToLaTeX (Header level (id',classes,_) lst) = do
 blockToLaTeX (Table caption aligns widths heads rows) = do
   headers <- if all null heads
                 then return empty
-                else ($$ "\\midrule\n") `fmap`
-                      (tableRowToLaTeX True aligns widths) heads
+                else do
+                    contents <- (tableRowToLaTeX True aligns widths) heads
+                    return ("\\toprule" $$ contents $$ "\\midrule")
   let endhead = if all null heads
                    then empty
                    else text "\\endhead"
+  let endfirsthead = if all null heads
+                       then empty
+                       else text "\\endfirsthead"
   captionText <- inlineListToLaTeX caption
   let capt = if isEmpty captionText
                 then empty
-                else text "\\caption" <> braces captionText
-                         <> "\\tabularnewline\n\\toprule\n"
-                         <> headers
-                         <> "\\endfirsthead"
+                else text "\\caption" <> braces captionText <> "\\tabularnewline"
+                         $$ headers
+                         $$ endfirsthead
   rows' <- mapM (tableRowToLaTeX False aligns widths) rows
   let colDescriptors = text $ concat $ map toColDescriptor aligns
   modify $ \s -> s{ stTable = True }
-  return $ "\\begin{longtable}[c]" <>
+  return $ "\\begin{longtable}[]" <>
               braces ("@{}" <> colDescriptors <> "@{}")
               -- the @{} removes extra space at beginning and end
          $$ capt
-         $$ "\\toprule"
+         $$ (if all null heads then "\\toprule" else empty)
          $$ headers
          $$ endhead
          $$ vcat rows'
@@ -526,7 +638,15 @@ tableRowToLaTeX header aligns widths cols = do
   -- scale factor compensates for extra space between columns
   -- so the whole table isn't larger than columnwidth
   let scaleFactor = 0.97 ** fromIntegral (length aligns)
-  let widths' = map (scaleFactor *) widths
+  let isSimple [Plain _] = True
+      isSimple [Para  _] = True
+      isSimple []        = True
+      isSimple _         = False
+  -- simple tables have to have simple cells:
+  let widths' = if not (all isSimple cols)
+                   then replicate (length aligns)
+                          (0.97 / fromIntegral (length aligns))
+                   else map (scaleFactor *) widths
   cells <- mapM (tableCellToLaTeX header) $ zip3 widths' aligns cols
   return $ hsep (intersperse "&" cells) <> "\\tabularnewline"
 
@@ -571,20 +691,22 @@ tableCellToLaTeX header (width, align, blocks) = do
                AlignDefault -> "\\raggedright"
   return $ ("\\begin{minipage}" <> valign <>
             braces (text (printf "%.2f\\columnwidth" width)) <>
-            (halign <> "\\strut" <> cr <> cellContents <> cr) <>
-            "\\strut\\end{minipage}")
-          $$ case notes of
-                  [] -> empty
-                  ns -> (case length ns of
+            (halign <> "\\strut" <> cr <> cellContents <> "\\strut" <> cr) <>
+            "\\end{minipage}") $$
+            notesToLaTeX notes
+
+notesToLaTeX :: [Doc] -> Doc
+notesToLaTeX [] = empty
+notesToLaTeX ns = (case length ns of
                               n | n > 1 -> "\\addtocounter" <>
                                            braces "footnote" <>
                                            braces (text $ show $ 1 - n)
                                 | otherwise -> empty)
-                        $$
-                        vcat (intersperse
-                          ("\\addtocounter" <> braces "footnote" <> braces "1")
-                          $ map (\x -> "\\footnotetext" <> braces x)
-                          $ reverse ns)
+                   $$
+                   vcat (intersperse
+                     ("\\addtocounter" <> braces "footnote" <> braces "1")
+                     $ map (\x -> "\\footnotetext" <> braces x)
+                     $ reverse ns)
 
 listItemToLaTeX :: [Block] -> State WriterState Doc
 listItemToLaTeX lst
@@ -601,8 +723,8 @@ defListItemToLaTeX (term, defs) = do
     term' <- inlineListToLaTeX term
     -- put braces around term if it contains an internal link,
     -- since otherwise we get bad bracket interactions: \item[\hyperref[..]
-    let isInternalLink (Link _ ('#':_,_)) = True
-        isInternalLink _                  = False
+    let isInternalLink (Link _ _ ('#':_,_)) = True
+        isInternalLink _                    = False
     let term'' = if any isInternalLink term
                     then braces term'
                     else term'
@@ -619,19 +741,19 @@ sectionHeader :: Bool    -- True for unnumbered
               -> Int
               -> [Inline]
               -> State WriterState Doc
-sectionHeader unnumbered ref level lst = do
+sectionHeader unnumbered ident level lst = do
   txt <- inlineListToLaTeX lst
-  lab <- text `fmap` toLabel ref
-  plain <- stringToLaTeX TextString $ foldl (++) "" $ map stringify lst
-  let noNote (Note _) = Str ""
-      noNote x        = x
-  let lstNoNotes = walk noNote lst
+  plain <- stringToLaTeX TextString $ concatMap stringify lst
+  let removeInvalidInline (Note _)      = []
+      removeInvalidInline (Span (id', _, _) _) | not (null id') = []
+      removeInvalidInline (Image _ _ _) = []
+      removeInvalidInline x             = [x]
+  let lstNoNotes = foldr (mappend . (\x -> walkM removeInvalidInline x)) mempty lst
   txtNoNotes <- inlineListToLaTeX lstNoNotes
-  let star = if unnumbered then text "*" else empty
   -- footnotes in sections don't work (except for starred variants)
   -- unless you specify an optional argument:
   -- \section[mysec]{mysec\footnote{blah}}
-  optional <- if unnumbered || lstNoNotes == lst
+  optional <- if unnumbered || lstNoNotes == lst || lstNoNotes == []
                  then return empty
                  else do
                    return $ brackets txtNoNotes
@@ -640,24 +762,23 @@ sectionHeader unnumbered ref level lst = do
                     else braces (text "\\texorpdfstring"
                          <> braces txt
                          <> braces (text plain))
-  let stuffing = star <> optional <> contents
   book <- gets stBook
   opts <- gets stOptions
-  let level' = if book || writerChapters opts then level - 1 else level
-  internalLinks <- gets stInternalLinks
-  let refLabel x = (if ref `elem` internalLinks
-                       then text "\\hyperdef"
-                                <> braces empty
-                                <> braces lab
-                                <> braces x
-                       else x)
-  let headerWith x y = refLabel $ text x <> y <>
-                             if null ref
-                                then empty
-                                else text "\\label" <> braces lab
+  let topLevelDivision = if book && writerTopLevelDivision opts == TopLevelDefault
+                         then TopLevelChapter
+                         else writerTopLevelDivision opts
+  let level' = if writerBeamer opts &&
+                  topLevelDivision `elem` [TopLevelPart, TopLevelChapter]
+               -- beamer has parts but no chapters
+               then if level == 1 then -1 else level - 1
+               else case topLevelDivision of
+                      TopLevelPart    -> level - 2
+                      TopLevelChapter -> level - 1
+                      TopLevelSection -> level
+                      TopLevelDefault -> level
   let sectionType = case level' of
-                          0  | writerBeamer opts -> "part"
-                             | otherwise -> "chapter"
+                          -1 -> "part"
+                          0  -> "chapter"
                           1  -> "section"
                           2  -> "subsection"
                           3  -> "subsubsection"
@@ -670,15 +791,35 @@ sectionHeader unnumbered ref level lst = do
                   -- needed for \paragraph, \subparagraph in quote environment
                   -- see http://tex.stackexchange.com/questions/169830/
                   else empty
+  lab <- labelFor ident
+  let star = if unnumbered && level' < 4 then text "*" else empty
+  let stuffing = star <> optional <> contents
+  stuffing' <- hypertarget ident $ text ('\\':sectionType) <> stuffing <> lab
   return $ if level' > 5
               then txt
-              else prefix $$
-                   headerWith ('\\':sectionType) stuffing
+              else prefix $$ stuffing'
                    $$ if unnumbered
                          then "\\addcontentsline{toc}" <>
                                 braces (text sectionType) <>
                                 braces txtNoNotes
                          else empty
+
+hypertarget :: String -> Doc -> State WriterState Doc
+hypertarget ident x = do
+  ref <- text `fmap` toLabel ident
+  internalLinks <- gets stInternalLinks
+  return $
+    if ident `elem` internalLinks
+       then text "\\hypertarget"
+              <> braces ref
+              <> braces x
+       else x
+
+labelFor :: String -> State WriterState Doc
+labelFor ""    = return empty
+labelFor ident = do
+  ref <- text `fmap` toLabel ident
+  return $ text "\\label" <> braces ref
 
 -- | Convert list of inline elements to LaTeX.
 inlineListToLaTeX :: [Inline]  -- ^ Inlines to convert
@@ -712,22 +853,27 @@ isQuoted _ = False
 -- | Convert inline element to LaTeX
 inlineToLaTeX :: Inline    -- ^ Inline to convert
               -> State WriterState Doc
-inlineToLaTeX (Span (id',classes,_) ils) = do
-  let noEmph = "csl-no-emph" `elem` classes
-  let noStrong = "csl-no-strong" `elem` classes
-  let noSmallCaps = "csl-no-smallcaps" `elem` classes
+inlineToLaTeX (Span (id',classes,kvs) ils) = do
   ref <- toLabel id'
   let linkAnchor = if null id'
                       then empty
-                      else "\\hyperdef{}" <> braces (text ref) <>
-                             braces ("\\label" <> braces (text ref))
-  fmap (linkAnchor <>)
-    ((if noEmph then inCmd "textup" else id) .
-     (if noStrong then inCmd "textnormal" else id) .
-     (if noSmallCaps then inCmd "textnormal" else id) .
-     (if not (noEmph || noStrong || noSmallCaps)
-         then braces
-         else id)) `fmap` inlineListToLaTeX ils
+                      else "\\protect\\hypertarget" <> braces (text ref) <>
+                             braces empty
+  let cmds = ["textup" | "csl-no-emph" `elem` classes] ++
+             ["textnormal" | "csl-no-strong" `elem` classes ||
+                             "csl-no-smallcaps" `elem` classes] ++
+             ["RL" | ("dir", "rtl") `elem` kvs] ++
+             ["LR" | ("dir", "ltr") `elem` kvs] ++
+             (case lookup "lang" kvs of
+                Just lng -> let (l, o) = toPolyglossia $ splitBy (=='-') lng
+                                ops = if null o then "" else ("[" ++ o ++ "]")
+                            in  ["text" ++ l ++ ops]
+                Nothing  -> [])
+  contents <- inlineListToLaTeX ils
+  return $ linkAnchor <>
+           if null cmds
+              then braces contents
+              else foldr inCmd contents cmds
 inlineToLaTeX (Emph lst) =
   inlineListToLaTeX lst >>= return . inCmd "emph"
 inlineToLaTeX (Strong lst) =
@@ -770,7 +916,7 @@ inlineToLaTeX (Code (_,classes,_) str) = do
            case highlight formatLaTeXInline ("",classes,[]) str of
                   Nothing -> rawCode
                   Just  h -> modify (\st -> st{ stHighlighting = True }) >>
-                             return (text h)
+                             return (text (T.unpack h))
          rawCode = liftM (text . (\s -> "\\texttt{" ++ escapeSpaces s ++ "}"))
                           $ stringToLaTeX CodeString str
            where
@@ -808,38 +954,59 @@ inlineToLaTeX (RawInline f str)
                         = return $ text str
   | otherwise           = return empty
 inlineToLaTeX (LineBreak) = return $ "\\\\" <> cr
+inlineToLaTeX SoftBreak = do
+  wrapText <- gets (writerWrapText . stOptions)
+  case wrapText of
+       WrapAuto     -> return space
+       WrapNone     -> return space
+       WrapPreserve -> return cr
 inlineToLaTeX Space = return space
-inlineToLaTeX (Link txt ('#':ident, _)) = do
+inlineToLaTeX (Link _ txt ('#':ident, _)) = do
   contents <- inlineListToLaTeX txt
   lab <- toLabel ident
-  return $ text "\\hyperref" <> brackets (text lab) <> braces contents
-inlineToLaTeX (Link txt (src, _)) =
+  return $ text "\\protect\\hyperlink" <> braces (text lab) <> braces contents
+inlineToLaTeX (Link _ txt (src, _)) =
   case txt of
         [Str x] | escapeURI x == src ->  -- autolink
              do modify $ \s -> s{ stUrl = True }
-                src' <- stringToLaTeX URLString src
+                src' <- stringToLaTeX URLString (escapeURI src)
                 return $ text $ "\\url{" ++ src' ++ "}"
         [Str x] | Just rest <- stripPrefix "mailto:" src,
                   escapeURI x == rest -> -- email autolink
              do modify $ \s -> s{ stUrl = True }
-                src' <- stringToLaTeX URLString src
+                src' <- stringToLaTeX URLString (escapeURI src)
                 contents <- inlineListToLaTeX txt
                 return $ "\\href" <> braces (text src') <>
                    braces ("\\nolinkurl" <> braces contents)
         _ -> do contents <- inlineListToLaTeX txt
-                src' <- stringToLaTeX URLString src
+                src' <- stringToLaTeX URLString (escapeURI src)
                 return $ text ("\\href{" ++ src' ++ "}{") <>
                          contents <> char '}'
-inlineToLaTeX (Image _ (source, _)) = do
+inlineToLaTeX (Image attr _ (source, _)) = do
   modify $ \s -> s{ stGraphics = True }
-  let source' = if isURI source
+  opts <- gets stOptions
+  let showDim dir = let d = text (show dir) <> "="
+                    in case (dimension dir attr) of
+                         Just (Pixel a)   ->
+                           [d <> text (showInInch opts (Pixel a)) <> "in"]
+                         Just (Percent a) ->
+                           [d <> text (showFl (a / 100)) <> "\\textwidth"]
+                         Just dim         ->
+                           [d <> text (show dim)]
+                         Nothing          ->
+                           []
+      dimList = showDim Width ++ showDim Height
+      dims = if null dimList
+                then empty
+                else brackets $ cat (intersperse "," dimList)
+      source' = if isURI source
                    then source
                    else unEscapeString source
   source'' <- stringToLaTeX URLString source'
   inHeading <- gets stInHeading
   return $
-    (if inHeading then "\\protect\\includegraphics" else "\\includegraphics")
-    <> braces (text source'')
+    (if inHeading then "\\protect\\includegraphics" else "\\includegraphics") <>
+    dims <> braces (text source'')
 inlineToLaTeX (Note contents) = do
   inMinipage <- gets stInMinipage
   modify (\s -> s{stInNote = True})
@@ -901,7 +1068,7 @@ citationsToNatbib (c:cs) | citationMode c == AuthorInText = do
 
 citationsToNatbib cits = do
   cits' <- mapM convertOne cits
-  return $ text "\\citetext{" <> foldl combineTwo empty cits' <> text "}"
+  return $ text "\\citetext{" <> foldl' combineTwo empty cits' <> text "}"
   where
     combineTwo a b | isEmpty a = b
                    | otherwise = a <> text "; " <> b
@@ -950,11 +1117,12 @@ citationsToBiblatex (one:[])
 
 citationsToBiblatex (c:cs) = do
   args <- mapM convertOne (c:cs)
-  return $ text cmd <> foldl (<>) empty args
+  return $ text cmd <> foldl' (<>) empty args
     where
        cmd = case citationMode c of
-                  AuthorInText -> "\\textcites"
-                  _            -> "\\autocites"
+                  SuppressAuthor -> "\\autocites*"
+                  AuthorInText   -> "\\textcites"
+                  NormalCitation -> "\\autocites"
        convertOne Citation { citationId = k
                            , citationPrefix = p
                            , citationSuffix = s
@@ -967,3 +1135,207 @@ citationsToBiblatex _ = return empty
 getListingsLanguage :: [String] -> Maybe String
 getListingsLanguage [] = Nothing
 getListingsLanguage (x:xs) = toListingsLanguage x <|> getListingsLanguage xs
+
+-- Extract a key from divs and spans
+extract :: String -> Block -> [String]
+extract key (Div attr _)     = lookKey key attr
+extract key (Plain ils)      = concatMap (extractInline key) ils
+extract key (Para ils)       = concatMap (extractInline key) ils
+extract key (Header _ _ ils) = concatMap (extractInline key) ils
+extract _ _                  = []
+
+-- Extract a key from spans
+extractInline :: String -> Inline -> [String]
+extractInline key (Span attr _) = lookKey key attr
+extractInline _ _               = []
+
+-- Look up a key in an attribute and give a list of its values
+lookKey :: String -> Attr -> [String]
+lookKey key (_,_,kvs) =  maybe [] words $ lookup key kvs
+
+-- In environments \Arabic instead of \arabic is used
+toPolyglossiaEnv :: String -> (String, String)
+toPolyglossiaEnv l =
+  case toPolyglossia $ (splitBy (=='-')) l of
+    ("arabic", o) -> ("Arabic", o)
+    x             -> x
+
+-- Takes a list of the constituents of a BCP 47 language code and
+-- converts it to a Polyglossia (language, options) tuple
+-- http://mirrors.ctan.org/macros/latex/contrib/polyglossia/polyglossia.pdf
+toPolyglossia :: [String] -> (String, String)
+toPolyglossia ("ar":"DZ":_)        = ("arabic", "locale=algeria")
+toPolyglossia ("ar":"IQ":_)        = ("arabic", "locale=mashriq")
+toPolyglossia ("ar":"JO":_)        = ("arabic", "locale=mashriq")
+toPolyglossia ("ar":"LB":_)        = ("arabic", "locale=mashriq")
+toPolyglossia ("ar":"LY":_)        = ("arabic", "locale=libya")
+toPolyglossia ("ar":"MA":_)        = ("arabic", "locale=morocco")
+toPolyglossia ("ar":"MR":_)        = ("arabic", "locale=mauritania")
+toPolyglossia ("ar":"PS":_)        = ("arabic", "locale=mashriq")
+toPolyglossia ("ar":"SY":_)        = ("arabic", "locale=mashriq")
+toPolyglossia ("ar":"TN":_)        = ("arabic", "locale=tunisia")
+toPolyglossia ("de":"1901":_)      = ("german", "spelling=old")
+toPolyglossia ("de":"AT":"1901":_) = ("german", "variant=austrian, spelling=old")
+toPolyglossia ("de":"AT":_)        = ("german", "variant=austrian")
+toPolyglossia ("de":"CH":"1901":_) = ("german", "variant=swiss, spelling=old")
+toPolyglossia ("de":"CH":_)        = ("german", "variant=swiss")
+toPolyglossia ("de":_)             = ("german", "")
+toPolyglossia ("dsb":_)            = ("lsorbian", "")
+toPolyglossia ("el":"polyton":_)   = ("greek",   "variant=poly")
+toPolyglossia ("en":"AU":_)        = ("english", "variant=australian")
+toPolyglossia ("en":"CA":_)        = ("english", "variant=canadian")
+toPolyglossia ("en":"GB":_)        = ("english", "variant=british")
+toPolyglossia ("en":"NZ":_)        = ("english", "variant=newzealand")
+toPolyglossia ("en":"UK":_)        = ("english", "variant=british")
+toPolyglossia ("en":"US":_)        = ("english", "variant=american")
+toPolyglossia ("grc":_)            = ("greek",   "variant=ancient")
+toPolyglossia ("hsb":_)            = ("usorbian", "")
+toPolyglossia ("la":"x":"classic":_) = ("latin", "variant=classic")
+toPolyglossia ("sl":_)             = ("slovenian", "")
+toPolyglossia x                    = (commonFromBcp47 x, "")
+
+-- Takes a list of the constituents of a BCP 47 language code and
+-- converts it to a Babel language string.
+-- http://mirrors.ctan.org/macros/latex/required/babel/base/babel.pdf
+-- List of supported languages (slightly outdated):
+-- http://tug.ctan.org/language/hyph-utf8/doc/generic/hyph-utf8/hyphenation.pdf
+toBabel :: [String] -> String
+toBabel ("de":"1901":_)      = "german"
+toBabel ("de":"AT":"1901":_) = "austrian"
+toBabel ("de":"AT":_)        = "naustrian"
+toBabel ("de":"CH":"1901":_) = "swissgerman"
+toBabel ("de":"CH":_)        = "nswissgerman"
+toBabel ("de":_)             = "ngerman"
+toBabel ("dsb":_)            = "lowersorbian"
+toBabel ("el":"polyton":_)   = "polutonikogreek"
+toBabel ("en":"AU":_)        = "australian"
+toBabel ("en":"CA":_)        = "canadian"
+toBabel ("en":"GB":_)        = "british"
+toBabel ("en":"NZ":_)        = "newzealand"
+toBabel ("en":"UK":_)        = "british"
+toBabel ("en":"US":_)        = "american"
+toBabel ("fr":"CA":_)        = "canadien"
+toBabel ("fra":"aca":_)      = "acadian"
+toBabel ("grc":_)            = "polutonikogreek"
+toBabel ("hsb":_)            = "uppersorbian"
+toBabel ("la":"x":"classic":_) = "classiclatin"
+toBabel ("sl":_)             = "slovene"
+toBabel x                    = commonFromBcp47 x
+
+-- Takes a list of the constituents of a BCP 47 language code
+-- and converts it to a string shared by Babel and Polyglossia.
+-- https://tools.ietf.org/html/bcp47#section-2.1
+commonFromBcp47 :: [String] -> String
+commonFromBcp47 [] = ""
+commonFromBcp47 ("pt":"BR":_)            = "brazil"
+-- Note: documentation says "brazilian" works too, but it doesn't seem to work
+-- on some systems.  See #2953.
+commonFromBcp47 ("sr":"Cyrl":_)          = "serbianc"
+commonFromBcp47 ("zh":"Latn":"pinyin":_) = "pinyin"
+commonFromBcp47 x = fromIso $ head x
+  where
+    fromIso "af"  = "afrikaans"
+    fromIso "am"  = "amharic"
+    fromIso "ar"  = "arabic"
+    fromIso "as"  = "assamese"
+    fromIso "ast" = "asturian"
+    fromIso "bg"  = "bulgarian"
+    fromIso "bn"  = "bengali"
+    fromIso "bo"  = "tibetan"
+    fromIso "br"  = "breton"
+    fromIso "ca"  = "catalan"
+    fromIso "cy"  = "welsh"
+    fromIso "cs"  = "czech"
+    fromIso "cop" = "coptic"
+    fromIso "da"  = "danish"
+    fromIso "dv"  = "divehi"
+    fromIso "el"  = "greek"
+    fromIso "en"  = "english"
+    fromIso "eo"  = "esperanto"
+    fromIso "es"  = "spanish"
+    fromIso "et"  = "estonian"
+    fromIso "eu"  = "basque"
+    fromIso "fa"  = "farsi"
+    fromIso "fi"  = "finnish"
+    fromIso "fr"  = "french"
+    fromIso "fur" = "friulan"
+    fromIso "ga"  = "irish"
+    fromIso "gd"  = "scottish"
+    fromIso "gez" = "ethiopic"
+    fromIso "gl"  = "galician"
+    fromIso "he"  = "hebrew"
+    fromIso "hi"  = "hindi"
+    fromIso "hr"  = "croatian"
+    fromIso "hu"  = "magyar"
+    fromIso "hy"  = "armenian"
+    fromIso "ia"  = "interlingua"
+    fromIso "id"  = "indonesian"
+    fromIso "ie"  = "interlingua"
+    fromIso "is"  = "icelandic"
+    fromIso "it"  = "italian"
+    fromIso "jp"  = "japanese"
+    fromIso "km"  = "khmer"
+    fromIso "kmr" = "kurmanji"
+    fromIso "kn"  = "kannada"
+    fromIso "ko"  = "korean"
+    fromIso "la"  = "latin"
+    fromIso "lo"  = "lao"
+    fromIso "lt"  = "lithuanian"
+    fromIso "lv"  = "latvian"
+    fromIso "ml"  = "malayalam"
+    fromIso "mn"  = "mongolian"
+    fromIso "mr"  = "marathi"
+    fromIso "nb"  = "norsk"
+    fromIso "nl"  = "dutch"
+    fromIso "nn"  = "nynorsk"
+    fromIso "no"  = "norsk"
+    fromIso "nqo" = "nko"
+    fromIso "oc"  = "occitan"
+    fromIso "pa"  = "panjabi"
+    fromIso "pl"  = "polish"
+    fromIso "pms" = "piedmontese"
+    fromIso "pt"  = "portuguese"
+    fromIso "rm"  = "romansh"
+    fromIso "ro"  = "romanian"
+    fromIso "ru"  = "russian"
+    fromIso "sa"  = "sanskrit"
+    fromIso "se"  = "samin"
+    fromIso "sk"  = "slovak"
+    fromIso "sq"  = "albanian"
+    fromIso "sr"  = "serbian"
+    fromIso "sv"  = "swedish"
+    fromIso "syr" = "syriac"
+    fromIso "ta"  = "tamil"
+    fromIso "te"  = "telugu"
+    fromIso "th"  = "thai"
+    fromIso "ti"  = "ethiopic"
+    fromIso "tk"  = "turkmen"
+    fromIso "tr"  = "turkish"
+    fromIso "uk"  = "ukrainian"
+    fromIso "ur"  = "urdu"
+    fromIso "vi"  = "vietnamese"
+    fromIso _     = ""
+
+deNote :: Inline -> Inline
+deNote (Note _) = RawInline (Format "latex") ""
+deNote x = x
+
+pDocumentOptions :: P.Parsec String () [String]
+pDocumentOptions = do
+  P.char '['
+  opts <- P.sepBy
+    (P.many $ P.spaces *> P.noneOf (" ,]" :: String) <* P.spaces)
+    (P.char ',')
+  P.char ']'
+  return opts
+
+pDocumentClass :: P.Parsec String () String
+pDocumentClass =
+  do P.skipMany (P.satisfy (/='\\'))
+     P.string "\\documentclass"
+     classOptions <- pDocumentOptions <|> return []
+     if ("article" :: String) `elem` classOptions
+       then return "article"
+       else do P.skipMany (P.satisfy (/='{'))
+               P.char '{'
+               P.manyTill P.letter (P.char '}')

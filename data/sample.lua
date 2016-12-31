@@ -84,7 +84,7 @@ function Doc(body, metadata, variables)
     end
     add('</ol>')
   end
-  return table.concat(buffer,'\n')
+  return table.concat(buffer,'\n') .. '\n'
 end
 
 -- The functions that follow render corresponding pandoc elements.
@@ -98,6 +98,10 @@ end
 
 function Space()
   return " "
+end
+
+function SoftBreak()
+  return "\n"
 end
 
 function LineBreak()
@@ -128,12 +132,12 @@ function Strikeout(s)
   return '<del>' .. s .. '</del>'
 end
 
-function Link(s, src, tit)
+function Link(s, src, tit, attr)
   return "<a href='" .. escape(src,true) .. "' title='" ..
          escape(tit,true) .. "'>" .. s .. "</a>"
 end
 
-function Image(s, src, tit)
+function Image(s, src, tit, attr)
   return "<img src='" .. escape(src,true) .. "' title='" ..
          escape(tit,true) .. "'/>"
 end
@@ -166,6 +170,12 @@ function Span(s, attr)
   return "<span" .. attributes(attr) .. ">" .. s .. "</span>"
 end
 
+function RawInline(format, str)
+  if format == "html" then
+    return str
+  end
+end
+
 function Cite(s, cs)
   local ids = {}
   for _,cit in ipairs(cs) do
@@ -194,6 +204,11 @@ end
 
 function HorizontalRule()
   return "<hr/>"
+end
+
+function LineBlock(ls)
+  return '<div style="white-space: pre-line;">' .. table.concat(ls, '\n') ..
+         '</div>'
 end
 
 function CodeBlock(s, attr)
@@ -251,6 +266,12 @@ function html_align(align)
   end
 end
 
+function CaptionedImage(src, tit, caption, attr)
+   return '<div class="figure">\n<img src="' .. escape(src,true) ..
+      '" title="' .. escape(tit,true) .. '"/>\n' ..
+      '<p class="caption">' .. caption .. '</p>\n</div>'
+end
+
 -- Caption is a string, aligns is an array of strings,
 -- widths is an array of floats, headers is an array of
 -- strings, rows is an array of arrays of strings.
@@ -295,6 +316,12 @@ function Table(caption, aligns, widths, headers, rows)
   end
   add('</table')
   return table.concat(buffer,'\n')
+end
+
+function RawBlock(format, str)
+  if format == "html" then
+    return str
+  end
 end
 
 function Div(s, attr)

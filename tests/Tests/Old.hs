@@ -6,7 +6,8 @@ import Test.HUnit ( assertBool )
 import System.Environment.Executable (getExecutablePath)
 import System.IO ( openTempFile, stderr )
 import System.Process ( runProcess, waitForProcess )
-import System.FilePath ( (</>), (<.>), takeDirectory, splitDirectories, joinPath )
+import System.FilePath ( (</>), (<.>), takeDirectory, splitDirectories,
+                         joinPath )
 import System.Directory
 import System.Exit
 import Data.Algorithm.Diff
@@ -57,7 +58,7 @@ tests = [ testGroup "markdown"
               "tables.txt" "tables.native"
             , test "pipe tables" ["-r", "markdown", "-w", "native", "--columns=80"]
               "pipe-tables.txt" "pipe-tables.native"
-            , test "more" ["-r", "markdown", "-w", "native", "-S"]
+            , test "more" ["-r", "markdown", "-w", "native", "-s", "-S"]
               "markdown-reader-more.txt" "markdown-reader-more.native"
             , lhsReaderTest "markdown+lhs"
             ]
@@ -105,6 +106,11 @@ tests = [ testGroup "markdown"
           [ testGroup "writer" $ writerTests "docbook"
           , test "reader" ["-r", "docbook", "-w", "native", "-s"]
             "docbook-reader.docbook" "docbook-reader.native"
+          , test "reader" ["-r", "docbook", "-w", "native", "-s"]
+            "docbook-xref.docbook" "docbook-xref.native"
+          ]
+        , testGroup "docbook5"
+          [ testGroup "writer" $ writerTests "docbook5"
           ]
         , testGroup "native"
           [ testGroup "writer" $ writerTests "native"
@@ -160,8 +166,14 @@ tests = [ testGroup "markdown"
           [ test "reader" ["-r", "twiki", "-w", "native", "-s"]
               "twiki-reader.twiki" "twiki-reader.native" ]
         , testGroup "other writers" $ map (\f -> testGroup f $ writerTests f)
-          [ "opendocument" , "context" , "texinfo", "icml"
-          , "man" , "plain" , "rtf", "org", "asciidoc"
+          [ "opendocument" , "context" , "texinfo", "icml", "tei"
+          , "man" , "plain" , "rtf", "org", "asciidoc", "zimwiki"
+          ]
+        , testGroup "writers-lang-and-dir"
+          [ test "latex" ["-f", "native", "-t", "latex", "-s"]
+            "writers-lang-and-dir.native" "writers-lang-and-dir.latex"
+          , test "context" ["-f", "native", "-t", "context", "-s"]
+            "writers-lang-and-dir.native" "writers-lang-and-dir.context"
           ]
         ]
 
@@ -176,7 +188,7 @@ lhsWriterTests format
     , t "lhs to lhs"    (format ++ "+lhs")
     ]
   where
-    t n f = test n ["--columns=78", "-r", "native", "-s", "-w", f]
+    t n f = test n ["--wrap=preserve", "-r", "native", "-s", "-w", f]
              "lhs-test.native" ("lhs-test" <.> f)
 
 lhsReaderTest :: String -> Test
@@ -194,7 +206,8 @@ writerTests format
     , test "tables" opts             "tables.native"    ("tables" <.> format)
     ]
   where
-    opts = ["-r", "native", "-w", format, "--columns=78"]
+    opts = ["-r", "native", "-w", format, "--columns=78",
+            "--variable", "pandoc-version="]
 
 s5WriterTest :: String -> [String] -> String -> Test
 s5WriterTest modifier opts format
@@ -248,9 +261,17 @@ testWithNormalize normalizer testname opts inp norm = testCase testname $ do
   let normPath = norm
   let options = ["--data-dir", ".." </> "data"] ++ [inpPath] ++ opts
   let cmd = pandocPath ++ " " ++ unwords options
+  let findDynlibDir [] = Nothing
+      findDynlibDir ("build":xs) = Just $ joinPath (reverse xs) </> "build"
+      findDynlibDir (_:xs) = findDynlibDir xs
+  let mbDynlibDir = findDynlibDir (reverse $ splitDirectories pandocPath)
+  let dynlibEnv = case mbDynlibDir of
+                       Nothing  -> []
+                       Just d   -> [("DYLD_LIBRARY_PATH", d),
+                                    ("LD_LIBRARY_PATH", d)]
+  let env = dynlibEnv ++ [("TMP","."),("LANG","en_US.UTF-8"),("HOME", "./")]
   ph <- runProcess pandocPath options Nothing
-        (Just [("TMP","."),("LANG","en_US.UTF-8"),("HOME", "./")]) Nothing (Just hOut)
-        (Just stderr)
+        (Just env) Nothing (Just hOut) (Just stderr)
   ec <- waitForProcess ph
   result  <- if ec == ExitSuccess
                 then do
